@@ -1,0 +1,8 @@
+# -*- coding: utf-8 -*-
+"""策略用常数（偏离度、补仓步长等）。"""
+# 偏离度超过此比例视为“涨太多”，提示不建议追高（与 RSI 无关）
+DEVIATION_CHASE_HIGH_PCT = 10.0
+# Core 资产在 MA200 之上时，每跌此比例提示一次分批金字塔补仓
+ADDON_DROP_PCT = 5.0
+# Core 买入：RSI 低于此值视为“回头买”条件之一
+CORE_RSI_PULLBACK = 40

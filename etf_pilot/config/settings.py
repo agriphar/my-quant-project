@@ -17,3 +17,8 @@ VOL_SHRINK_RATIO = 0.8  # 缩量：当日量 < 近 N 日均量的此比例
 
 # 缓存过期时间（秒），减少 AkShare 请求
 CACHE_TTL = 300
+
+# 自动资产分类（classify_etfs）
+CLASSIFICATION_VOL_THRESHOLD = 0.25   # 年化波动率 < 25% 且宽基 -> Core
+CLASSIFICATION_CACHE_DAYS = 7         # 分类结果缓存天数
+CLASSIFICATION_LOOKBACK_YEARS = 3     # 使用过去 N 年日线计算波动率/回撤

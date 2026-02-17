@@ -7,13 +7,13 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 
-from config.settings import (
-    RSI_PERIOD,
-    BB_PERIOD,
-    BB_STD,
-    RSI_OVERBOUGHT,
-    RSI_BULLISH_MAX,
-    VOL_SHRINK_RATIO,
+from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD
+from strategy import (
+    get_asset_type,
+    compute_signal,
+    compute_deviation,
+    check_chase_high,
+    compute_addon_suggestion,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -33,11 +33,14 @@ def ensure_data_dir():
 
 
 def load_etf_list() -> pd.DataFrame:
-    """从 data/ETF汇总.xlsx 读取 ETF 列表，返回 代码、名称、指数简称。"""
+    """从 data/ETF汇总.xlsx 读取 ETF 列表，返回 代码、名称、指数简称、类型(Core/Tactical)。"""
+    from strategy.asset_type import get_asset_type
+
     ensure_data_dir()
     if not ETF_LIST_PATH.exists():
         df = pd.DataFrame(DEFAULT_ETF_LIST)
         df["指数简称"] = "其他"
+        df["类型"] = df["名称"].map(get_asset_type)
         df.to_excel(ETF_LIST_PATH, index=False)
         return df
     df = pd.read_excel(ETF_LIST_PATH, header=1)
@@ -58,12 +61,22 @@ def load_etf_list() -> pd.DataFrame:
                 df = df.rename(columns={c: "名称"})
         if "指数简称" not in df.columns:
             df["指数简称"] = "其他"
+    # 类型：Excel 列 类型/type/资产类型 优先；否则使用自动分类（classify_etfs + 缓存）
+    type_col = next((c for c in df.columns if str(c).strip() in ("类型", "type", "资产类型")), None)
+    if type_col is not None:
+        df["类型"] = df.apply(lambda r: get_asset_type(r.get("名称", ""), r.get(type_col)), axis=1)
+    else:
+        try:
+            from strategy.classification import get_cached_classification
+            df = get_cached_classification(df)
+        except Exception:
+            df["类型"] = df["名称"].map(lambda n: get_asset_type(n, None))
     df = df.loc[
         df["代码"].notna()
         & (df["代码"].astype(str).str.len() >= 5)
         & (df["代码"].astype(str).str.lower() != "nan")
     ]
-    return df[["代码", "名称", "指数简称"]].dropna(subset=["代码"]).drop_duplicates(subset=["代码"])
+    return df[["代码", "名称", "指数简称", "类型"]].dropna(subset=["代码"]).drop_duplicates(subset=["代码"])
 
 
 def _normalize_hist(raw: pd.DataFrame) -> pd.DataFrame | None:
@@ -103,9 +116,10 @@ def fetch_etf_daily(
     ma_short: int = 5,
     ma_long: int = 20,
 ) -> pd.DataFrame | None:
-    """获取单只 ETF 日线并计算 MA、RSI、布林带。失败返回 None。"""
+    """获取单只 ETF 日线并计算 MA5/20/60/200、RSI、布林带。失败返回 None。"""
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=max(days, 60))
+    need_days = max(days, 280)  # MA200 需要约 250 根 K 线
+    start_date = end_date - timedelta(days=need_days)
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
     try:
@@ -123,34 +137,17 @@ def fetch_etf_daily(
     df = _normalize_hist(raw)
     if df is None or df.empty:
         return None
-    df = df.sort_values("日期").tail(days + 30).reset_index(drop=True)
+    df = df.sort_values("日期").tail(max(days + 30, 250)).reset_index(drop=True)
     close = df["收盘"]
     df["MA_short"] = close.rolling(ma_short, min_periods=1).mean()
     df["MA_long"] = close.rolling(ma_long, min_periods=1).mean()
+    df["MA20"] = close.rolling(20, min_periods=1).mean()
+    df["MA60"] = close.rolling(60, min_periods=1).mean()
+    df["MA200"] = close.rolling(200, min_periods=1).mean()
     df["RSI"] = _rsi(close, RSI_PERIOD)
     mid, upper, lower = _bollinger(close, BB_PERIOD, BB_STD)
     df["BB_upper"], df["BB_lower"] = upper, lower
     return df
-
-
-def _composite_signal(last: pd.Series, prev_vol_avg: float) -> str:
-    """多因子综合信号：买入 / 持有 / 减仓。"""
-    close = last["收盘"]
-    ma_long = last["MA_long"]
-    rsi = last["RSI"]
-    bb_lower = last.get("BB_lower")
-    vol = last.get("成交量") or 0
-    if pd.isna(close) or pd.isna(ma_long):
-        return "持有"
-    if rsi is not None and not pd.isna(rsi) and rsi > RSI_OVERBOUGHT:
-        return "减仓"
-    if close < ma_long:
-        return "减仓"
-    if bb_lower is not None and not pd.isna(bb_lower) and close <= bb_lower * 1.002 and prev_vol_avg > 0 and vol < prev_vol_avg * VOL_SHRINK_RATIO:
-        return "买入"
-    if rsi is not None and not pd.isna(rsi) and close > ma_long and rsi < RSI_BULLISH_MAX:
-        return "买入"
-    return "持有"
 
 
 def _suggested_position(volatility: float, volatilities: list[float]) -> str:
@@ -183,6 +180,7 @@ def build_monitor_table_advanced(
         code = str(row["代码"]).strip()
         name = row.get("名称", code)
         category = row.get("指数简称", "其他")
+        asset_type = row.get("类型") or get_asset_type(name, None)
         err_msg = None
         try:
             hist = get_hist(code, days, ma_short, ma_long)
@@ -191,9 +189,10 @@ def build_monitor_table_advanced(
             err_msg = str(e)[:80]
         if hist is None or hist.empty:
             rows.append({
-                "代码": code, "名称": name, "指数简称": category,
+                "代码": code, "名称": name, "指数简称": category, "类型": asset_type,
                 "最新价": None, "涨跌幅": None, "MA_short": None, "MA_long": None,
-                "RSI": None, "BB_lower": None, "信号": "—", "建议仓位": "—",
+                "RSI": None, "BB_lower": None, "偏离度": None, "追高提示": "", "补仓建议": "",
+                "信号": "—", "建议仓位": "—",
                 "错误": err_msg or "获取失败",
             })
             continue
@@ -204,19 +203,26 @@ def build_monitor_table_advanced(
         pct = (float((close - prev_close) / prev_close * 100)) if prev_close and prev_close != 0 else None
         vol_avg = hist["成交量"].replace(0, np.nan).dropna().tail(5).mean() if "成交量" in hist.columns else 0
         vol_avg = vol_avg if not pd.isna(vol_avg) else 0
-        signal = _composite_signal(last, vol_avg)
+        signal = compute_signal(asset_type, last, prev, vol_avg)
+        dev_pct = compute_deviation(float(close) if close is not None else None, float(last["MA20"]) if last.get("MA20") is not None else None)
+        chase = check_chase_high(dev_pct)
+        high_20 = hist["收盘"].tail(20).max() if len(hist) >= 20 else None
+        addon = compute_addon_suggestion(asset_type, float(close) if close is not None else None, last.get("MA200"), high_20)
         ret = hist["收盘"].pct_change().dropna().tail(20)
         vol = float(ret.std()) if len(ret) > 0 else None
         if vol is not None:
             volatilities.append(vol)
         rows.append({
-            "代码": code, "名称": name, "指数简称": category,
+            "代码": code, "名称": name, "指数简称": category, "类型": asset_type,
             "最新价": round(float(close), 4),
             "涨跌幅": round(pct, 2) if pct is not None else None,
             "MA_short": round(float(last["MA_short"]), 4) if last.get("MA_short") is not None else None,
             "MA_long": round(float(last["MA_long"]), 4) if last.get("MA_long") is not None else None,
             "RSI": round(float(last["RSI"]), 1) if last.get("RSI") is not None and not pd.isna(last["RSI"]) else None,
             "BB_lower": round(float(last["BB_lower"]), 4) if last.get("BB_lower") is not None and not pd.isna(last.get("BB_lower")) else None,
+            "偏离度": dev_pct,
+            "追高提示": chase,
+            "补仓建议": addon,
             "信号": signal,
             "建议仓位": None,
             "错误": None,

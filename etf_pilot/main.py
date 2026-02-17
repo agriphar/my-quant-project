@@ -133,8 +133,8 @@ def _style_pct(df: pd.DataFrame, pct_col: str = "涨跌幅"):
 tab_radar, tab_detail, tab_deep = st.tabs(["实时雷达", "策略详情", "个股深度分析"])
 
 with tab_radar:
-    st.caption("核心一览：最新价、涨跌幅、信号、建议仓位")
-    show_cols = ["代码", "名称", "指数简称", "最新价", "涨跌幅", "信号", "建议仓位"]
+    st.caption("核心一览：类型、最新价、涨跌幅、信号、建议仓位")
+    show_cols = ["代码", "名称", "类型", "指数简称", "最新价", "涨跌幅", "信号", "建议仓位"]
     show_cols = [c for c in show_cols if c in df_display.columns]
     radar_df = df_display[show_cols]
     st.dataframe(
@@ -148,8 +148,8 @@ with tab_radar:
     )
 
 with tab_detail:
-    st.caption("多因子策略：MA、RSI、布林下轨、信号与建议仓位")
-    detail_cols = ["代码", "名称", "指数简称", "最新价", "涨跌幅", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位"]
+    st.caption("资产分级策略：类型、MA/RSI/布林、偏离度、追高提示、补仓建议、信号与建议仓位")
+    detail_cols = ["代码", "名称", "类型", "指数简称", "最新价", "涨跌幅", "偏离度", "追高提示", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位", "补仓建议"]
     detail_cols = [c for c in detail_cols if c in df_display.columns]
     detail_df = df_display[detail_cols]
     st.dataframe(
@@ -158,6 +158,7 @@ with tab_detail:
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.4f"),
             "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
+            "偏离度": st.column_config.NumberColumn(format="%.2f"),
             "MA_short": st.column_config.NumberColumn(format="%.4f"),
             "MA_long": st.column_config.NumberColumn(format="%.4f"),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
@@ -292,8 +293,29 @@ with tab_deep:
 
 st.divider()
 st.caption(f"ETF 列表配置：{ETF_LIST_PATH}")
-st.markdown(
-    "**信号说明**：🚀 买入 = 价格>MA20 且 RSI<70（看多）或触及布林下轨且缩量 · "
-    "🛡️ 持有 · ⚠️ 减仓 = 跌破 MA20 或 RSI>80（超买）。"
-    " **建议仓位**：按波动率计算，波动大仓位轻、平稳仓位重。"
-)
+
+with st.expander("📖 点击查看深度策略与风控说明", expanded=False):
+    st.markdown("""
+**一、信号说明（Core 与 Tactical 区分）**
+
+- **Core（核心稳健）**  
+  - **买入**：价格在 MA200 上方，且（回踩 MA20 或 RSI < 40）——牛市回头买。  
+  - **卖出**：仅在跌破 MA60 且 MA20 向下死叉 MA60 时卖出，避免频繁择时。
+
+- **Tactical（战术进攻）**  
+  - **买入**：价格在 MA20 上方且 RSI 未超买，或触及布林下轨且缩量。  
+  - **卖出**：跌破 MA20 或 RSI > 80 即减仓，强调止损与趋势跟踪。
+
+> 偏离度过高（相对 MA20 涨幅 ≥ 10%）时，会提示「不建议追高」，与 RSI 是否到 80 无关。  
+> Core 资产在 MA200 之上时，自近期高点每跌 5% 会提示「分批金字塔补仓」。
+
+---
+
+**二、建议仓位说明**
+
+> **为什么波动大的标的买得少、波动小的买得多？**
+
+- 建议仓位根据**近 20 日收益率波动率**在全部标的中的相对水平计算：波动率越高，建议仓位越低；波动率越低，建议仓位越高。
+- **逻辑**：同一笔资金，波动大的标的潜在回撤更大，用较小仓位控制单标的风险；波动小的标的更稳，可适当提高仓位，在风险可控前提下提高资金利用。
+- 展示为 **高(60–80%) / 中(40–60%) / 低(20–40%)**，供参考，不构成具体买卖建议。
+    """)
