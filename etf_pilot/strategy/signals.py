@@ -11,7 +11,12 @@ from config.settings import (
     VOL_SHRINK_RATIO,
 )
 from .asset_type import ASSET_TYPE_CORE, ASSET_TYPE_TACTICAL
-from .constants import DEVIATION_CHASE_HIGH_PCT, ADDON_DROP_PCT, CORE_RSI_PULLBACK
+from .constants import (
+    DEVIATION_CHASE_HIGH_PCT,
+    ADDON_DROP_PCT,
+    CORE_RSI_PULLBACK,
+    CORE_MA200_DEVIATION_SELL_PCT,
+)
 
 
 def compute_deviation(price: float | None, ma20: float | None) -> float | None:
@@ -31,7 +36,7 @@ def check_chase_high(deviation_pct: float | None) -> str:
 
 
 def _core_buy(last: pd.Series) -> bool:
-    """Core 买入：价格 > MA200 且 (回踩 MA20 或 RSI < 40)。"""
+    """Core 买入：价格 > MA200（大趋势向上）且 价格回撤至 MA20 附近 或 RSI < 45。"""
     price = last.get("收盘")
     ma20 = last.get("MA20")
     ma200 = last.get("MA200")
@@ -40,30 +45,26 @@ def _core_buy(last: pd.Series) -> bool:
         return False
     if price <= ma200:
         return False
-    # 回踩 MA20：价格在 MA20 附近（2% 以内）或略低于 MA20
+    # 回踩 MA20 附近：价格在 MA20 上下 2% 以内
     pullback_ma20 = ma20 and (price <= ma20 * 1.02 or abs(price - ma20) / ma20 < 0.02)
-    rsi_oversold = rsi is not None and not pd.isna(rsi) and rsi < CORE_RSI_PULLBACK
-    return bool(pullback_ma20 or rsi_oversold)
+    rsi_pullback = rsi is not None and not pd.isna(rsi) and rsi < CORE_RSI_PULLBACK
+    return bool(pullback_ma20 or rsi_pullback)
 
 
 def _core_sell(last: pd.Series, prev: pd.Series) -> bool:
-    """Core 卖出：跌破 MA60 且 MA20 向下交叉 MA60（死叉）。"""
+    """Core 卖出：跌破 MA60 或 价格相对 MA200 乖离率过大（过高）时减仓。"""
     price = last.get("收盘")
-    ma20 = last.get("MA20")
     ma60 = last.get("MA60")
-    prev_ma20 = prev.get("MA20")
-    prev_ma60 = prev.get("MA60")
-    if any(pd.isna(x) or x is None for x in (price, ma20, ma60)):
+    ma200 = last.get("MA200")
+    if any(pd.isna(x) or x is None for x in (price, ma60)):
         return False
-    if price >= ma60:
-        return False
-    if ma20 >= ma60:
-        return False
-    # 死叉：前一日 MA20 >= MA60，当日 MA20 < MA60（刚发生死叉）
-    if prev_ma20 is not None and prev_ma60 is not None and not pd.isna(prev_ma20) and not pd.isna(prev_ma60):
-        if prev_ma20 < prev_ma60:
-            return True  # 已死叉且价格在 MA60 下，维持卖出
-    return True  # 当日 MA20 < MA60 且价格 < MA60 即视为卖出
+    if price < ma60:
+        return True
+    if ma200 is not None and not pd.isna(ma200) and ma200 > 0:
+        deviation_ma200 = (price - ma200) / ma200 * 100
+        if deviation_ma200 >= CORE_MA200_DEVIATION_SELL_PCT:
+            return True
+    return False
 
 
 def _tactical_buy(last: pd.Series, prev_vol_avg: float) -> bool:
@@ -126,7 +127,7 @@ def compute_addon_suggestion(
     high_20d: float | None,
 ) -> str:
     """
-    Core 资产在 MA200 之上时，相对近期高点每跌 5% 提示「分批金字塔补仓」。
+    Core 资产：在已有持仓基础上，若自近期高点进一步下跌 5% 且仍位于 MA200 之上，可增加 0.5 倍仓位（最多 3 批）。
     """
     if asset_type != ASSET_TYPE_CORE:
         return ""
@@ -139,5 +140,4 @@ def compute_addon_suggestion(
     drop_pct = (high_20d - price) / high_20d * 100
     if drop_pct < ADDON_DROP_PCT:
         return ""
-    n = int(drop_pct / ADDON_DROP_PCT)
-    return f"自近期高点回落约 {drop_pct:.1f}%，可考虑分批金字塔补仓（每跌{ADDON_DROP_PCT}%一档）"
+    return f"自近期高点回落约 {drop_pct:.1f}%，若仍在 MA200 之上可加仓 0.5 倍仓位（每跌{ADDON_DROP_PCT}%一档，最多 3 批）"

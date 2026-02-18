@@ -17,9 +17,28 @@ from etf_data import (
     build_monitor_table_advanced,
     fetch_etf_daily,
     get_etf_hist_for_chart,
+    get_rsr_panel,
+    get_equal_weight_panel,
     ETF_LIST_PATH,
     ensure_data_dir,
 )
+from strategy.rsr_backtest import run_rsr_backtest
+from strategy.equal_weight_backtest import run_equal_weight_backtest
+from config.settings import (
+    BACKTEST_YEARS,
+    RSR_INITIAL_CASH,
+    RSR_FEE_RATE,
+    RSR_MIN_FEE,
+    RSR_REBALANCE_FREQ,
+    RSR_GLOBAL_MA20_THRESHOLD,
+    EW_INITIAL_CASH,
+    EW_FEE_RATE,
+    EW_MIN_FEE,
+    EW_DEVIATION_THRESHOLD,
+    EW_REBALANCE_TRADING_DAYS,
+)
+from config.rsr_groups import get_code_to_group
+from config.equal_weight_pool import get_pool_codes
 
 st.set_page_config(page_title="跨境 ETF 监控", page_icon="📈", layout="wide")
 st.title("📈 A 股跨境 ETF 监控")
@@ -130,7 +149,7 @@ def _style_pct(df: pd.DataFrame, pct_col: str = "涨跌幅"):
     return df.style
 
 # ---------- Tabs ----------
-tab_radar, tab_detail, tab_deep = st.tabs(["实时雷达", "策略详情", "个股深度分析"])
+tab_radar, tab_detail, tab_deep, tab_backtest = st.tabs(["实时雷达", "策略详情", "个股深度分析", "策略回测"])
 
 with tab_radar:
     st.caption("核心一览：类型、最新价、涨跌幅、信号、建议仓位")
@@ -291,23 +310,105 @@ with tab_deep:
                 fig.update_xaxes(title_text="日期", row=2, col=1)
                 st.plotly_chart(fig, use_container_width=True)
 
+with tab_backtest:
+    st.caption("跨资产等权动态再平衡：5 只精选标的（纳指/标普/黄金/日经/红利）各 20%；每两周检查，任一权重偏离 20% 超过 ±3% 则再平衡；佣金万五、无最低。基准为 5 只简单平均不调仓。")
+    if st.button("运行等权再平衡回测", key="ew_run"):
+        pool_codes = get_pool_codes()
+        with st.spinner("拉取 5 只标的日线并对齐日期…"):
+            panel_ew = get_equal_weight_panel(pool_codes, years=BACKTEST_YEARS)
+        if panel_ew is None or len(panel_ew) < 100:
+            st.warning("5 只精选标的数据不足，无法回测。")
+        else:
+            daily_bt, metrics_bt, rebalance_dates = run_equal_weight_backtest(
+                panel_ew,
+                initial_cash=EW_INITIAL_CASH,
+                fee_rate=EW_FEE_RATE,
+                min_fee=EW_MIN_FEE,
+                deviation_threshold=EW_DEVIATION_THRESHOLD,
+                rebalance_interval_days=EW_REBALANCE_TRADING_DAYS,
+            )
+            if daily_bt.empty:
+                st.warning("回测未产生有效结果。")
+            else:
+                fig_bt = go.Figure()
+                fig_bt.add_trace(
+                    go.Scatter(
+                        x=daily_bt["日期"],
+                        y=daily_bt["策略净值"],
+                        mode="lines",
+                        name="再平衡策略净值",
+                        line=dict(color="rgb(33, 150, 243)", width=2),
+                    )
+                )
+                fig_bt.add_trace(
+                    go.Scatter(
+                        x=daily_bt["日期"],
+                        y=daily_bt["基准净值"],
+                        mode="lines",
+                        name="5只等权不调仓(基准)",
+                        line=dict(color="rgb(158, 158, 158)", width=1.5, dash="dash"),
+                    )
+                )
+                # 再平衡时刻标记点
+                if rebalance_dates:
+                    rb_pairs = [(d, float(daily_bt.loc[daily_bt["日期"] == d, "策略净值"].iloc[0])) for d in rebalance_dates if (daily_bt["日期"] == d).any()]
+                    rb_dates = [p[0] for p in rb_pairs]
+                    rb_nav = [p[1] for p in rb_pairs]
+                    fig_bt.add_trace(
+                        go.Scatter(
+                            x=rb_dates,
+                            y=rb_nav,
+                            mode="markers",
+                            name="再平衡",
+                            marker=dict(symbol="triangle-up", size=10, color="red", line=dict(width=1, color="darkred")),
+                        )
+                    )
+                fig_bt.update_layout(
+                    title="等权再平衡策略 vs 5 只等权不调仓（红三角=再平衡时刻）",
+                    xaxis_title="日期",
+                    yaxis_title="净值",
+                    height=420,
+                    template="plotly_white",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_bt, use_container_width=True)
+
+                st.subheader("收益对比")
+                strat_ret = metrics_bt.get("累计收益率", 0) or 0
+                bench_ret = metrics_bt.get("基准累计收益率", 0) or 0
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("策略累计收益率", f"{strat_ret * 100:.2f}%", f"{(strat_ret - bench_ret) * 100:+.2f}% vs 基准")
+                with c2:
+                    st.metric("策略最终净值", f"¥{metrics_bt.get('策略最终净值', 0):,.0f}", None)
+                with c3:
+                    st.metric("基准最终净值", f"¥{metrics_bt.get('基准最终净值', 0):,.0f}", None)
+
+                st.subheader("性能指标")
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("年化收益率", f"{(metrics_bt.get('年化收益率') or 0) * 100:.2f}%", None)
+                with m2:
+                    st.metric("最大回撤", f"{(metrics_bt.get('最大回撤') or 0) * 100:.2f}%", None)
+                with m3:
+                    st.metric("夏普比率", f"{(metrics_bt.get('夏普比率') or 0):.2f}", None)
+                with m4:
+                    st.metric("再平衡次数", f"{metrics_bt.get('再平衡次数') or 0}", None)
+
+                st.caption("红三角为触发再平衡的交易日（某标的权重偏离 20% 超过 ±3%）。")
+
 st.divider()
 st.caption(f"ETF 列表配置：{ETF_LIST_PATH}")
 
 with st.expander("📖 点击查看深度策略与风控说明", expanded=False):
     st.markdown("""
-**一、信号说明（Core 与 Tactical 区分）**
+**一、跨资产等权动态再平衡策略**
 
-- **Core（核心稳健）**  
-  - **买入**：价格在 MA200 上方，且（回踩 MA20 或 RSI < 40）——牛市回头买。  
-  - **卖出**：仅在跌破 MA60 且 MA20 向下死叉 MA60 时卖出，避免频繁择时。
-
-- **Tactical（战术进攻）**  
-  - **买入**：价格在 MA20 上方且 RSI 未超买，或触及布林下轨且缩量。  
-  - **卖出**：跌破 MA20 或 RSI > 80 即减仓，强调止损与趋势跟踪。
-
-> 偏离度过高（相对 MA20 涨幅 ≥ 10%）时，会提示「不建议追高」，与 RSI 是否到 80 无关。  
-> Core 资产在 MA200 之上时，自近期高点每跌 5% 会提示「分批金字塔补仓」。
+- **精选池**：5 只长期代表资产——513100 纳指、513500 标普、518880 黄金、513520 日经、510880 红利 ETF。
+- **初始分配**：初始资金 50 万元，五只各 **20%** 仓位。
+- **再平衡**：**每两周**（约 10 个交易日）检查一次；若某标的权重偏离 20% 超过 **±3%**（阈值可调），则触发再平衡：卖出超配、买入欠配，使五只重新回到 20%。
+- **成本**：佣金 **0.0005**（万五），暂不设最低 5 元。
+- **对比**：策略净值 vs **5 只简单平均、不调仓**的净值（买入持有等权）。图中**红三角**为每次再平衡发生的时刻。
 
 ---
 
