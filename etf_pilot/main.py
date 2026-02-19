@@ -20,9 +20,11 @@ from etf_data import (
     fetch_etf_hist_for_backtest,
     ETF_LIST_PATH,
     ensure_data_dir,
+    ASSET_TREND,
+    ASSET_OSCILLATING,
 )
 from strategy.grid_backtest import run_grid_backtest
-from config.settings import BACKTEST_YEARS, GRID_SYMBOL_DEFAULT
+from config.settings import BACKTEST_YEARS
 
 st.set_page_config(page_title="跨境 ETF 监控", page_icon="📈", layout="wide")
 st.title("📈 A 股跨境 ETF 监控")
@@ -63,8 +65,8 @@ with st.sidebar:
     )
     if ma_short >= ma_long:
         st.warning("建议短期 < 长期")
-    days = 180
-    st.caption(f"数据：最近 {days} 个交易日 · 缓存 {CACHE_TTL}s")
+    days = 250
+    st.caption(f"数据：最近 {days} 个交易日（含 ADX/ER 分类）· 缓存 {CACHE_TTL}s")
 
 # ---------- 缓存：按全量列表拉取，再按类别过滤显示 ----------
 @st.cache_data(ttl=CACHE_TTL)
@@ -136,25 +138,35 @@ def _style_pct(df: pd.DataFrame, pct_col: str = "涨跌幅"):
 tab_radar, tab_detail, tab_deep, tab_backtest = st.tabs(["实时雷达", "策略详情", "个股深度分析", "策略回测"])
 
 with tab_radar:
-    st.caption("清爽一览：代码、名称、现价、今日波动率、信号（步进式网格逻辑）")
-    show_cols = ["代码", "名称", "最新价", "今日波动率", "信号"]
+    st.caption("清爽一览：代码、名称、现价、今日波动率、趋势强度(ADX)、资产性格、信号")
+    show_cols = ["代码", "名称", "最新价", "今日波动率", "趋势强度(ADX)", "资产性格", "信号"]
     show_cols = [c for c in show_cols if c in df_display.columns]
     radar_df = df_display[show_cols].copy()
     if "最新价" in radar_df.columns:
         radar_df = radar_df.rename(columns={"最新价": "现价"})
+    # 趋势型蓝色、震荡型紫色
+    def _row_style(row):
+        p = row.get("资产性格") if "资产性格" in row.index else None
+        if p == ASSET_TREND:
+            return ["background-color: rgba(33,150,243,0.15)"] * len(row)
+        if p == ASSET_OSCILLATING:
+            return ["background-color: rgba(156,39,176,0.15)"] * len(row)
+        return [""] * len(row)
+    styled = radar_df.style.apply(_row_style, axis=1)
     st.dataframe(
-        radar_df,
+        styled,
         use_container_width=True,
         column_config={
             "现价": st.column_config.NumberColumn(format="%.4f"),
             "今日波动率": st.column_config.NumberColumn(format="%.2f%%"),
+            "趋势强度(ADX)": st.column_config.NumberColumn(format="%.2f"),
         },
         hide_index=True,
     )
 
 with tab_detail:
-    st.caption("资产分级策略：类型、MA/RSI/布林、偏离度、追高提示、补仓建议、信号与建议仓位")
-    detail_cols = ["代码", "名称", "类型", "指数简称", "最新价", "涨跌幅", "偏离度", "追高提示", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位", "补仓建议"]
+    st.caption("趋势强度(ADX)、资产性格、MA/RSI/布林、偏离度、信号与建议仓位")
+    detail_cols = ["代码", "名称", "趋势强度(ADX)", "资产性格", "指数简称", "最新价", "涨跌幅", "偏离度", "追高提示", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位"]
     detail_cols = [c for c in detail_cols if c in df_display.columns]
     detail_df = df_display[detail_cols]
     st.dataframe(
@@ -303,27 +315,32 @@ with tab_deep:
 with tab_backtest:
     @st.fragment
     def _backtest_fragment():
-        st.caption("步进式网格做T：初始 50 万、50% 底仓、5% 一格；High/Low 触发，last_op_price 步进；成本 max(成交额×0.0012, 5) 元。")
-        full_codes = sorted(etf_list_full["代码"].astype(str).unique().tolist())
-        name_by_code = dict(zip(etf_list_full["代码"].astype(str), etf_list_full["名称"]))
-        grid_symbol = st.selectbox(
+        st.caption("步进式网格做T：按资产性格自动匹配（趋势型 80% 底仓只买不卖，震荡型 30% 底仓双向网格）。标的顺序与「个股深度分析」一致。")
+        # 与个股深度分析同一选择逻辑：按 df_display 源数据顺序
+        grid_options = [f"{row['名称']} ({row['代码']})" for _, row in df_display.iterrows()]
+        grid_display_to_code = {f"{row['名称']} ({row['代码']})": str(row["代码"]) for _, row in df_display.iterrows()}
+        grid_code_to_personality = dict(zip(df_display["代码"].astype(str), df_display["资产性格"]))
+        grid_symbol_display = st.selectbox(
             "网格标的",
-            options=full_codes if full_codes else [""],
-            index=full_codes.index(GRID_SYMBOL_DEFAULT) if full_codes and GRID_SYMBOL_DEFAULT in full_codes else 0,
-            format_func=lambda c: f"{name_by_code.get(c, c)} ({c})" if c else "请先加载 ETF 列表",
+            options=grid_options if grid_options else ["请先加载 ETF 列表"],
+            index=0,
             key="grid_symbol_select",
         )
+        grid_symbol = grid_display_to_code.get(grid_symbol_display) if grid_symbol_display in grid_display_to_code else None
         if st.button("运行网格回测", key="grid_run"):
-            if not (grid_symbol and str(grid_symbol).strip()):
+            if not grid_symbol:
                 st.warning("请选择网格标的。")
             else:
-                grid_name = name_by_code.get(grid_symbol, grid_symbol)
+                grid_name = next((row["名称"] for _, row in df_display.iterrows() if str(row["代码"]) == grid_symbol), grid_symbol)
+                asset_personality = grid_code_to_personality.get(grid_symbol)
                 with st.spinner(f"拉取 {grid_name}({grid_symbol}) 日线…"):
                     series_grid = fetch_etf_hist_for_backtest(grid_symbol, years=BACKTEST_YEARS)
                 if series_grid is None or len(series_grid) < 50:
                     st.warning(f"标的 {grid_name}({grid_symbol}) 日线数据不足。")
                 else:
-                    daily_grid, metrics_grid, grid_trades = run_grid_backtest(series_grid, debug=True)
+                    daily_grid, metrics_grid, grid_trades = run_grid_backtest(
+                        series_grid, debug=True, asset_personality=asset_personality
+                    )
                     if daily_grid.empty:
                         st.warning("回测未产生有效结果。")
                     else:
@@ -372,6 +389,13 @@ with tab_backtest:
                         )
                         st.plotly_chart(fig_bt, use_container_width=True)
 
+                        # 资产性格与策略说明
+                        personality = metrics_grid.get("资产性格")
+                        strategy_desc = metrics_grid.get("策略说明")
+                        if personality or strategy_desc:
+                            st.subheader("资产性格与策略")
+                            st.markdown(f"**{personality or '—'}** · {strategy_desc or ''}")
+
                         # 清爽表格：代码、名称、现价、今日波动率、累计网格利润（一行）
                         vol_20 = None
                         if "收盘" in series_grid.columns and len(series_grid) >= 20:
@@ -388,10 +412,23 @@ with tab_backtest:
                         st.dataframe(summary, use_container_width=True, hide_index=True,
                                      column_config={"现价": st.column_config.NumberColumn(format="%.4f")})
 
-                        # 手续费统计
+                        # 手续费/利润比、网格活跃度
                         total_fee = metrics_grid.get("总手续费") or 0
                         fee_pct = metrics_grid.get("手续费占利润比pct") or 0
-                        st.metric("总手续费", f"¥{total_fee:,.2f}", f"占利润 {fee_pct:.1f}%")
+                        fee_ratio = metrics_grid.get("手续费利润比")
+                        active = metrics_grid.get("网格活跃度_每周成交次数")
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.metric("总手续费", f"¥{total_fee:,.2f}", None)
+                        with c2:
+                            st.metric("手续费/利润比", f"{fee_pct:.1f}%" if fee_pct is not None else "—", "占利润比例")
+                        with c3:
+                            st.metric("网格活跃度", f"{active:.2f} 次/周" if active is not None else "—", "平均每周成交次数")
+
+                        # 自动建议
+                        suggestion = metrics_grid.get("自动建议")
+                        if suggestion:
+                            st.info("💡 " + suggestion)
 
                         # 操作日志：最近 10 次网格成交
                         st.subheader("最近 10 次网格成交")
@@ -404,6 +441,41 @@ with tab_backtest:
                             st.dataframe(log_df, use_container_width=True, hide_index=True)
                         else:
                             st.caption("无网格成交记录（仅初始底仓）。")
+
+                        # 趋势型 vs 震荡型 网格贡献对比（自动验证「震荡型是否更适合做T」）
+                        st.subheader("趋势型 vs 震荡型 网格贡献对比")
+                        if st.button("运行对比（当前列表前 20 只）", key="grid_compare_run"):
+                            limit = min(20, len(df_display))
+                            results_by_personality = []
+                            with st.spinner(f"正在对前 {limit} 只标的逐只回测并分组…"):
+                                for idx in range(limit):
+                                    row = df_display.iloc[idx]
+                                    code = str(row["代码"])
+                                    name = row["名称"]
+                                    pers = row.get("资产性格")
+                                    if pers not in (ASSET_TREND, ASSET_OSCILLATING):
+                                        continue
+                                    series_bt = fetch_etf_hist_for_backtest(code, years=BACKTEST_YEARS)
+                                    if series_bt is None or len(series_bt) < 50:
+                                        continue
+                                    _, m, _ = run_grid_backtest(series_bt, debug=False, asset_personality=pers)
+                                    if m:
+                                        results_by_personality.append({
+                                            "资产性格": pers,
+                                            "累计网格利润": m.get("累计网格利润", 0),
+                                            "做T额外收益pct": m.get("做T额外收益pct", 0),
+                                        })
+                            if results_by_personality:
+                                comp_df = pd.DataFrame(results_by_personality)
+                                summary_comp = comp_df.groupby("资产性格").agg(
+                                    标的数=("资产性格", "count"),
+                                    平均累计网格利润=("累计网格利润", "mean"),
+                                    平均做T额外收益pct=("做T额外收益pct", "mean"),
+                                ).reset_index()
+                                st.dataframe(summary_comp, use_container_width=True, hide_index=True)
+                                st.caption("验证：若震荡型平均做T额外收益高于趋势型，则说明震荡型资产更适合网格做T。")
+                            else:
+                                st.caption("无有效回测结果（需标的含趋势型/震荡型分类）。")
     _backtest_fragment()
 
 st.divider()
@@ -413,11 +485,10 @@ with st.expander("📖 步进式网格做T 说明", expanded=False):
     st.markdown("""
 **步进式网格 (Stepping Grid)**
 
-- **资金**：初始 50 万元，**50% 底仓**（首日收盘价买入），**50% 现金**用于网格做 T；每格为总资产的 **5%**。
-- **last_op_price**：初始为回测第一天收盘价。每次成交后更新为本次成交价。
-- **买入**：当日 **Low** 触及 `last_op_price × (1 - 1.2%)` 则买入一格，并更新 last_op_price。
-- **卖出**：当日 **High** 触及 `last_op_price × (1 + 1.2%)` 且有多仓则卖出一格，并更新 last_op_price。
-- **同一天**可先买后卖（波动大时同时触发）。
-- **成本**：每笔 `max(成交额 × 0.0012, 5)` 元（万一二，最低 5 元）。回测输出总手续费及占利润百分比。
-- **信号**：实时雷达中，默认网格标的（513110）按「现价 vs 近 30 日均价」±1.2% 给出 买入/卖出/持有，与步进逻辑一致。
+- **资金**：初始 50 万元，50% 底仓、50% 现金做 T，每格 5%。
+- **ATR 自适应步长**：每日 `grid_step = ATR(14) / 当前价格`，步长随波动变化，限制在 0.5%～5%。
+- **成交判定**：使用 **High/Low**：当日 **Low** 触及买入档则买，**High** 触及卖出档则卖；现金用完停止买、仓位卖完停止卖。
+- **盈利门槛**：预期利润 `单笔额×grid_step` 须 ≥ 15 元（3 倍最低手续费）才触发，否则放弃该笔，减少无效损耗。
+- **成本**：`max(成交额×0.0012, 5)`。页面展示 **手续费/利润比**、**网格活跃度**（平均每周成交次数）及 **自动建议**（效果不佳时提示波动率或单笔投入）。
+- **信号**：默认网格标的（513110）按「现价 vs 近 30 日均价」±1.2% 给出 买入/卖出/持有。
     """)

@@ -9,11 +9,8 @@ import akshare as ak
 
 from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD, GRID_SYMBOL_DEFAULT
 from strategy import (
-    get_asset_type,
-    compute_signal,
     compute_deviation,
     check_chase_high,
-    compute_addon_suggestion,
     compute_grid_signal,
 )
 
@@ -118,6 +115,70 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return tr.rolling(period, min_periods=1).mean()
 
 
+# 趋势/震荡分类：ADX(14)、ER(250)
+ADX_PERIOD = 14
+ER_WINDOW = 250
+ADX_TREND_THRESHOLD = 23
+ER_TREND_THRESHOLD = 0.15
+ASSET_TREND = "Trend (趋势型)"
+ASSET_OSCILLATING = "Oscillating (震荡型)"
+
+
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = ADX_PERIOD) -> pd.Series:
+    """ADX(14)：Wilder 平滑的 +DM/-DM/TR -> +DI/-DI -> DX -> ADX。"""
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+    up_move = high - prev_high
+    down_move = prev_low - low
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
+    # Wilder 平滑：alpha = 1/period
+    alpha = 1.0 / period
+    smooth_tr = pd.Series(tr, index=close.index).ewm(alpha=alpha, adjust=False).mean()
+    smooth_plus_dm = pd.Series(plus_dm, index=close.index).ewm(alpha=alpha, adjust=False).mean()
+    smooth_minus_dm = pd.Series(minus_dm, index=close.index).ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * smooth_plus_dm / smooth_tr.replace(0, np.nan)
+    minus_di = 100 * smooth_minus_dm / smooth_tr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx
+
+
+def _efficiency_ratio(close: pd.Series, window: int = ER_WINDOW) -> float:
+    """ER = |当前价 - window日前价| / sum(每日波动绝对值)。"""
+    if close is None or len(close) < window:
+        return 0.0
+    c = close.iloc[-window:]
+    net = abs(c.iloc[-1] - c.iloc[0])
+    if net == 0:
+        return 0.0
+    daily_changes = c.diff().abs().dropna()
+    total = daily_changes.sum()
+    if total == 0:
+        return 0.0
+    return float(net / total)
+
+
+def compute_trend_classification(hist: pd.DataFrame) -> tuple:
+    """根据过去 250 日计算 ADX(14)、ER；ADX>23 且 ER>0.15 为 Trend，否则 Oscillating。返回 (adx_last, er, 资产性格)。"""
+    if hist is None or len(hist) < ER_WINDOW or "收盘" not in hist.columns:
+        return None, None, None
+    close = hist["收盘"]
+    high = hist["最高"] if "最高" in hist.columns else close
+    low = hist["最低"] if "最低" in hist.columns else close
+    last_250 = hist.tail(ER_WINDOW)
+    adx_s = _adx(last_250["最高"], last_250["最低"], last_250["收盘"], ADX_PERIOD)
+    adx_last = float(adx_s.iloc[-1]) if len(adx_s) and pd.notna(adx_s.iloc[-1]) else None
+    er = _efficiency_ratio(close.tail(ER_WINDOW), ER_WINDOW)
+    if adx_last is not None and er is not None:
+        personality = ASSET_TREND if (adx_last > ADX_TREND_THRESHOLD and er > ER_TREND_THRESHOLD) else ASSET_OSCILLATING
+    else:
+        personality = None
+    return adx_last, er, personality
+
+
 def fetch_etf_daily(
     symbol: str,
     days: int = 30,
@@ -145,7 +206,18 @@ def fetch_etf_daily(
     df = _normalize_hist(raw)
     if df is None or df.empty:
         return None
-    df = df.sort_values("日期").tail(max(days + 30, 250)).reset_index(drop=True)
+    raw["日期"] = pd.to_datetime(raw["日期"])
+    for col in ["开盘", "最高", "最低"]:
+        if col in raw.columns:
+            aux = raw[["日期", col]].drop_duplicates("日期")
+            df = df.merge(aux, on="日期", how="left")
+        else:
+            df[col] = np.nan
+    if "最高" not in df.columns:
+        df["最高"] = df["收盘"]
+    if "最低" not in df.columns:
+        df["最低"] = df["收盘"]
+    df = df.sort_values("日期").tail(max(days + 30, ER_WINDOW)).reset_index(drop=True)
     close = df["收盘"]
     df["MA_short"] = close.rolling(ma_short, min_periods=1).mean()
     df["MA_long"] = close.rolling(ma_long, min_periods=1).mean()
@@ -188,7 +260,6 @@ def build_monitor_table_advanced(
         code = str(row["代码"]).strip()
         name = row.get("名称", code)
         category = row.get("指数简称", "其他")
-        asset_type = row.get("类型") or get_asset_type(name, None)
         err_msg = None
         try:
             hist = get_hist(code, days, ma_short, ma_long)
@@ -197,7 +268,8 @@ def build_monitor_table_advanced(
             err_msg = str(e)[:80]
         if hist is None or hist.empty:
             rows.append({
-                "代码": code, "名称": name, "指数简称": category, "类型": asset_type,
+                "代码": code, "名称": name, "指数简称": category,
+                "趋势强度(ADX)": None, "资产性格": None,
                 "最新价": None, "涨跌幅": None, "MA_short": None, "MA_long": None,
                 "RSI": None, "BB_lower": None, "偏离度": None, "追高提示": "", "补仓建议": "",
                 "信号": "—", "建议仓位": "—",
@@ -209,26 +281,22 @@ def build_monitor_table_advanced(
         close = last["收盘"]
         prev_close = prev["收盘"]
         pct = (float((close - prev_close) / prev_close * 100)) if prev_close and prev_close != 0 else None
-        vol_avg = hist["成交量"].replace(0, np.nan).dropna().tail(5).mean() if "成交量" in hist.columns else 0
-        vol_avg = vol_avg if not pd.isna(vol_avg) else 0
-        if code == str(GRID_SYMBOL_DEFAULT).strip():
-            center_30 = hist["收盘"].tail(30).mean()
-            signal = compute_grid_signal(
-                float(close) if close is not None else None,
-                float(center_30) if pd.notna(center_30) and center_30 > 0 else None,
-            )
-        else:
-            signal = compute_signal(asset_type, last, prev, vol_avg)
+        adx_last, er, personality = compute_trend_classification(hist)
+        center_30 = hist["收盘"].tail(30).mean()
+        signal = compute_grid_signal(
+            float(close) if close is not None else None,
+            float(center_30) if pd.notna(center_30) and center_30 > 0 else None,
+        )
         dev_pct = compute_deviation(float(close) if close is not None else None, float(last["MA20"]) if last.get("MA20") is not None else None)
         chase = check_chase_high(dev_pct)
-        high_20 = hist["收盘"].tail(20).max() if len(hist) >= 20 else None
-        addon = compute_addon_suggestion(asset_type, float(close) if close is not None else None, last.get("MA200"), high_20)
         ret = hist["收盘"].pct_change().dropna().tail(20)
         vol = float(ret.std()) if len(ret) > 0 else None
         if vol is not None:
             volatilities.append(vol)
         rows.append({
-            "代码": code, "名称": name, "指数简称": category, "类型": asset_type,
+            "代码": code, "名称": name, "指数简称": category,
+            "趋势强度(ADX)": round(adx_last, 2) if adx_last is not None else None,
+            "资产性格": personality or "—",
             "最新价": round(float(close), 4),
             "涨跌幅": round(pct, 2) if pct is not None else None,
             "MA_short": round(float(last["MA_short"]), 4) if last.get("MA_short") is not None else None,
@@ -237,7 +305,7 @@ def build_monitor_table_advanced(
             "BB_lower": round(float(last["BB_lower"]), 4) if last.get("BB_lower") is not None and not pd.isna(last.get("BB_lower")) else None,
             "偏离度": dev_pct,
             "追高提示": chase,
-            "补仓建议": addon,
+            "补仓建议": "",
             "信号": signal,
             "建议仓位": None,
             "错误": None,
