@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Core / Tactical 信号、偏离度、追高提示、补仓建议。"""
+"""Core / Tactical 信号、偏离度、追高提示、补仓建议；智能网格做T 信号（与回测一致）。"""
 import pandas as pd
 
 from config.settings import (
@@ -9,6 +9,7 @@ from config.settings import (
     RSI_OVERBOUGHT,
     RSI_BULLISH_MAX,
     VOL_SHRINK_RATIO,
+    GRID_STEP_PCT,
 )
 from .asset_type import ASSET_TYPE_CORE, ASSET_TYPE_TACTICAL
 from .constants import (
@@ -17,6 +18,21 @@ from .constants import (
     CORE_RSI_PULLBACK,
     CORE_MA200_DEVIATION_SELL_PCT,
 )
+
+
+def compute_grid_signal(price: float | None, center_30: float | None, step_pct: float = GRID_STEP_PCT) -> str:
+    """
+    步进式网格信号（与回测一致）：参考价为近 30 日均价，步长 step_pct（1.2%）。
+    现价 ≤ 参考×(1-step) → 买入；≥ 参考×(1+step) → 卖出；否则 持有。
+    """
+    if price is None or center_30 is None or pd.isna(price) or pd.isna(center_30) or center_30 <= 0:
+        return "持有"
+    p, c = float(price), float(center_30)
+    if p <= c * (1 - step_pct):
+        return "买入"
+    if p >= c * (1 + step_pct):
+        return "卖出"
+    return "持有"
 
 
 def compute_deviation(price: float | None, ma20: float | None) -> float | None:

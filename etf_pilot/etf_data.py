@@ -7,13 +7,14 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 
-from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD
+from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD, GRID_SYMBOL_DEFAULT
 from strategy import (
     get_asset_type,
     compute_signal,
     compute_deviation,
     check_chase_high,
     compute_addon_suggestion,
+    compute_grid_signal,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -210,7 +211,14 @@ def build_monitor_table_advanced(
         pct = (float((close - prev_close) / prev_close * 100)) if prev_close and prev_close != 0 else None
         vol_avg = hist["成交量"].replace(0, np.nan).dropna().tail(5).mean() if "成交量" in hist.columns else 0
         vol_avg = vol_avg if not pd.isna(vol_avg) else 0
-        signal = compute_signal(asset_type, last, prev, vol_avg)
+        if code == str(GRID_SYMBOL_DEFAULT).strip():
+            center_30 = hist["收盘"].tail(30).mean()
+            signal = compute_grid_signal(
+                float(close) if close is not None else None,
+                float(center_30) if pd.notna(center_30) and center_30 > 0 else None,
+            )
+        else:
+            signal = compute_signal(asset_type, last, prev, vol_avg)
         dev_pct = compute_deviation(float(close) if close is not None else None, float(last["MA20"]) if last.get("MA20") is not None else None)
         chase = check_chase_high(dev_pct)
         high_20 = hist["收盘"].tail(20).max() if len(hist) >= 20 else None
@@ -233,6 +241,7 @@ def build_monitor_table_advanced(
             "信号": signal,
             "建议仓位": None,
             "错误": None,
+            "今日波动率": round(float(vol) * 100, 2) if vol is not None and not pd.isna(vol) else None,
             "_vol": vol,
         })
     for r in rows:
