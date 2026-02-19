@@ -1,0 +1,16 @@
+# A 股跨境 ETF 监控工具 - 依赖
+# Python 3.9+
+
+# 前端与可视化
+streamlit>=1.33.0
+plotly>=5.18.0
+
+# 数据与计算
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 行情与基金数据（AkShare）
+akshare>=1.14.0
+
+# Excel 读写（ETF 列表 .xlsx）
+openpyxl>=3.1.0
