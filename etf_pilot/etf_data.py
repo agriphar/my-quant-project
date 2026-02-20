@@ -124,6 +124,12 @@ RSI_ADDON_MAX = 45        # RSI < 45 视为可分批吸纳
 BB_UPPER_TOUCH = 0.998    # 收盘 >= 布林上轨*此系数视为触及上轨
 SIGNAL_FWD_DAYS = 3       # 信号准确率：看 N 日后收益
 SIGNAL_LOOKBACK_DAYS = 30 # 过去 30 天统计准确率
+# 溢价基准与动态信号
+PREMIUM_AVG_DAYS = 22           # 过去 22 个交易日（约一个月）平均溢价率
+PREMIUM_PCTILE_DAYS = 60       # 分位统计窗口 60 天
+PREMIUM_SAFE_PLUS_PCT = 1.0    # 当前溢价 < 平均溢价 + 1% 视为安全，允许按技术面给建议
+PREMIUM_EXTREME_MULT = 1.5     # 当前溢价 > 平均溢价 * 1.5
+PREMIUM_PCTILE_HIGH = 90       # 分位 > 90% 且满足倍数时强制减仓/观望
 
 
 def _linear_regression_r2_slope(close: pd.Series, window: int = REGRESSION_WINDOW) -> tuple:
@@ -182,14 +188,28 @@ def _bias_pct(price: float | None, ma: float | None) -> float | None:
     return round((float(price) - float(ma)) / float(ma) * 100, 2)
 
 
-def compute_daily_action(last: pd.Series) -> tuple:
+def compute_daily_action(
+    last: pd.Series,
+    premium_pct: float | None = None,
+    avg_premium_22d: float | None = None,
+    premium_pctile_60: float | None = None,
+) -> tuple:
     """
     每日操作建议：返回 (操作, 理由)。
-    操作: 分批吸纳 / 套利离场 / 持有观望。
-    - 分批吸纳：价格回落至 MA60 附近且 RSI < 45
-    - 套利离场：价格触及布林带上轨（若网格利润覆盖 5 倍手续费更佳，此处简化为触及上轨）
-    - 持有观望：其余
+    动态溢价判定：
+    - 若 当前溢价 > 平均溢价*1.5 且 分位>90%：强制「溢价极高，建议减仓或观望」。
+    - 若 当前溢价 < 平均溢价+1%：溢价环境安全，按技术指标给建议。
     """
+    if (
+        premium_pct is not None
+        and not pd.isna(premium_pct)
+        and avg_premium_22d is not None
+        and not pd.isna(avg_premium_22d)
+        and premium_pctile_60 is not None
+        and not pd.isna(premium_pctile_60)
+    ):
+        if premium_pct > avg_premium_22d * PREMIUM_EXTREME_MULT and premium_pctile_60 > PREMIUM_PCTILE_HIGH:
+            return "溢价极高，建议减仓或观望", "当前溢价显著高于近期均值且处于历史高位，不宜追高"
     close = last.get("收盘")
     ma60 = last.get("MA60")
     rsi = last.get("RSI")
@@ -265,6 +285,145 @@ def drawdown_15pct_value(current_value: float) -> float:
     return round(float(current_value) * (1 - 0.15), 2)
 
 
+def get_etf_nav_hist(symbol: str, days: int = 70) -> pd.DataFrame | None:
+    """获取单只 ETF 历史单位净值，用于计算历史溢价率。返回 日期、单位净值。"""
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days + 20)
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+    try:
+        raw = ak.fund_etf_fund_info_em(
+            fund=symbol.strip(),
+            start_date=start_str,
+            end_date=end_str,
+        )
+    except Exception:
+        return None
+    if raw is None or raw.empty:
+        return None
+    raw = raw.rename(columns=lambda c: str(c).strip())
+    date_col = "净值日期"
+    nav_col = "单位净值"
+    if date_col not in raw.columns or nav_col not in raw.columns:
+        return None
+    df = raw[[date_col, nav_col]].copy()
+    df["日期"] = pd.to_datetime(df[date_col]).dt.normalize()
+    df = df.dropna(subset=[nav_col]).sort_values("日期").tail(days).reset_index(drop=True)
+    return df[["日期", nav_col]].rename(columns={nav_col: "单位净值"})
+
+
+def _percentileofscore(arr: np.ndarray, score: float) -> float:
+    """0~100，表示 score 在 arr 中的百分位（小于等于 score 的比例 * 100）。"""
+    if arr is None or len(arr) == 0:
+        return np.nan
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if len(arr) == 0:
+        return np.nan
+    return float(np.sum(arr <= score) / len(arr) * 100)
+
+
+def get_etf_premium_stats(
+    hist: pd.DataFrame,
+    nav_hist: pd.DataFrame | None,
+    current_premium: float | None,
+) -> tuple[float | None, float | None]:
+    """
+    根据日线 hist（日期、收盘）与净值 nav_hist（日期、单位净值）计算：
+    - 过去 22 日平均溢价率
+    - 当前溢价在 60 日内的百分位（0~100，满格=近期最贵）
+    若缺数据则返回 (None, None)。
+    """
+    if hist is None or hist.empty or "收盘" not in hist.columns or current_premium is None or pd.isna(current_premium):
+        return None, None
+    if nav_hist is None or nav_hist.empty or "单位净值" not in nav_hist.columns:
+        return None, None
+    # 按日期对齐：hist 与 nav 合并
+    hist = hist[["日期", "收盘"]].copy()
+    hist["日期"] = pd.to_datetime(hist["日期"]).dt.normalize()
+    nav_hist = nav_hist.copy()
+    nav_hist["日期"] = pd.to_datetime(nav_hist["日期"]).dt.normalize()
+    merged = hist.merge(nav_hist, on="日期", how="inner")
+    merged = merged[merged["单位净值"].notna() & (merged["单位净值"] > 0)]
+    if merged.empty:
+        return None, None
+    merged["溢价率"] = (merged["收盘"].astype(float) - merged["单位净值"].astype(float)) / merged["单位净值"].astype(float) * 100
+    merged = merged.dropna(subset=["溢价率"]).sort_values("日期").tail(PREMIUM_PCTILE_DAYS)
+    if len(merged) < 5:
+        return None, None
+    avg_22 = float(merged["溢价率"].tail(PREMIUM_AVG_DAYS).mean())
+    pct_60 = _percentileofscore(merged["溢价率"].values, float(current_premium))
+    return round(avg_22, 2), round(pct_60, 1)
+
+
+def get_etf_spot_premium_map(etf_codes: list[str]) -> dict[str, float]:
+    """
+    通过东方财富 fund_etf_spot_em 获取 IOPV 实时估值，计算溢价率。
+    溢价率 = (当前市价 - IOPV) / IOPV * 100%
+    返回 {代码: 溢价率%}，缺失或无效的代码不出现或可后续用 None 表示。
+    """
+    codes_set = {str(c).strip() for c in etf_codes if c}
+    out = {}
+    try:
+        spot = ak.fund_etf_spot_em()
+    except Exception:
+        return out
+    if spot is None or spot.empty:
+        return out
+    spot = spot.rename(columns=lambda c: str(c).strip())
+    price_col = "最新价"
+    iopv_col = "IOPV实时估值"
+    code_col = "代码"
+    if code_col not in spot.columns or price_col not in spot.columns or iopv_col not in spot.columns:
+        return out
+    for _, r in spot.iterrows():
+        code = str(r.get(code_col, "")).strip()
+        if code not in codes_set:
+            continue
+        try:
+            price = r.get(price_col)
+            iopv = r.get(iopv_col)
+            if pd.isna(price) or pd.isna(iopv) or iopv is None or float(iopv) <= 0:
+                continue
+            price, iopv = float(price), float(iopv)
+            premium = (price - iopv) / iopv * 100
+            out[code] = round(premium, 2)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def format_premium_with_bar(premium_pct: float | None, pctile_60: float | None, bar_len: int = 10) -> str:
+    """
+    溢价率显示：数字 + 百分位进度条（满格=近期最贵）。
+    例如 "2.30% ████████░░ 80"
+    """
+    if premium_pct is None or pd.isna(premium_pct):
+        return "—"
+    pct = float(pctile_60) if pctile_60 is not None and not pd.isna(pctile_60) else None
+    s = f"{float(premium_pct):.2f}%"
+    if pct is not None and 0 <= pct <= 100:
+        filled = int(round(bar_len * pct / 100))
+        filled = min(bar_len, max(0, filled))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        s += f" {bar} {pct:.0f}"
+    return s
+
+
+def rsi_status_label(rsi: float | None) -> str:
+    """RSI 状态灯：超跌准备买 / 安全区间 / 警惕超买 / 危险准备卖。"""
+    if rsi is None or pd.isna(rsi):
+        return "—"
+    r = float(rsi)
+    if r < 45:
+        return "超跌准备买"
+    if r <= 70:
+        return "安全区间"
+    if r <= 80:
+        return "警惕超买"
+    return "危险准备卖"
+
+
 def fetch_etf_daily(
     symbol: str,
     days: int = 30,
@@ -316,26 +475,28 @@ def fetch_etf_daily(
     return df
 
 
-def _qdii_premium_placeholder(_code: str) -> str:
-    """QDII ETF 溢价率：接口允许时填入，否则返回占位。"""
-    return "—"
-
-
 def build_monitor_table_advanced(
     etf_list: pd.DataFrame,
     days: int = 30,
     ma_short: int = 5,
     ma_long: int = 20,
     fetcher: Callable[[str, int, int, int], pd.DataFrame | None] | None = None,
+    spot_premium_map: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """拉取日线，计算行情透视、偏离度、每日操作建议与建议操作频率；单只失败则该行填错误。"""
+    """拉取日线，计算行情透视、偏离度、溢价率、每日操作建议与建议操作频率；单只失败则该行填错误。"""
     get_hist = fetcher or (lambda s, d, ms, ml: fetch_etf_daily(s, d, ms, ml))
+    if spot_premium_map is None:
+        try:
+            spot_premium_map = get_etf_spot_premium_map(etf_list["代码"].astype(str).tolist())
+        except Exception:
+            spot_premium_map = {}
     rows = []
     for _, row in etf_list.iterrows():
         code = str(row["代码"]).strip()
         name = row.get("名称", code)
         category = row.get("指数简称", "其他")
         err_msg = None
+        premium_pct = spot_premium_map.get(code)
         try:
             hist = get_hist(code, max(days, SIGNAL_LOOKBACK_DAYS + 10), ma_short, ma_long)
         except Exception as e:
@@ -345,15 +506,22 @@ def build_monitor_table_advanced(
             rows.append({
                 "代码": code, "名称": name, "指数简称": category,
                 "最新价": None, "涨跌幅": None,
+                "MA5": None, "MA20": None, "MA60": None, "MA200": None,
                 "距一年高%": None, "距一年低%": None,
                 "Bias_MA20": None, "Bias_MA60": None, "Bias_MA200": None,
                 "明日建议": "—", "建议理由": "",
                 "建议操作频率": 0,
-                "溢价率": _qdii_premium_placeholder(code),
+                "溢价率": premium_pct if premium_pct is not None else None,
+                "溢价率均值22d": None,
+                "溢价分位60d": None,
+                "溢价率显示": "—",
+                "RSI状态": "—", "RSI": None,
                 "信号准确率30d": None,
                 "错误": err_msg or "获取失败",
             })
             continue
+        nav_hist = get_etf_nav_hist(code, PREMIUM_PCTILE_DAYS + 20)
+        avg_premium_22d, premium_pctile_60d = get_etf_premium_stats(hist, nav_hist, premium_pct)
         last = hist.iloc[-1]
         prev = hist.iloc[-2] if len(hist) >= 2 else last
         close = last["收盘"]
@@ -363,19 +531,38 @@ def build_monitor_table_advanced(
         bias_20 = _bias_pct(float(close) if close is not None else None, last.get("MA20"))
         bias_60 = _bias_pct(float(close) if close is not None else None, last.get("MA60"))
         bias_200 = _bias_pct(float(close) if close is not None else None, last.get("MA200"))
-        action, reason = compute_daily_action(last)
+        action, reason = compute_daily_action(
+            last,
+            premium_pct=premium_pct,
+            avg_premium_22d=avg_premium_22d,
+            premium_pctile_60=premium_pctile_60d,
+        )
         freq = compute_action_frequency(hist, SIGNAL_LOOKBACK_DAYS)
         acc = compute_signal_accuracy_30d(hist)
+        rsi_val = last.get("RSI")
+        def _round_ma(v):
+            if v is None or pd.isna(v):
+                return None
+            return round(float(v), 4)
         rows.append({
             "代码": code, "名称": name, "指数简称": category,
             "最新价": round(float(close), 4),
             "涨跌幅": round(pct, 2) if pct is not None else None,
+            "MA5": _round_ma(last.get("MA_short")),
+            "MA20": _round_ma(last.get("MA20")),
+            "MA60": _round_ma(last.get("MA60")),
+            "MA200": _round_ma(last.get("MA200")),
             "距一年高%": round(pct_high, 2) if pct_high is not None else None,
             "距一年低%": round(pct_low, 2) if pct_low is not None else None,
             "Bias_MA20": bias_20, "Bias_MA60": bias_60, "Bias_MA200": bias_200,
             "明日建议": action, "建议理由": reason,
             "建议操作频率": freq,
-            "溢价率": _qdii_premium_placeholder(code),
+            "溢价率": premium_pct,
+            "溢价率均值22d": avg_premium_22d,
+            "溢价分位60d": premium_pctile_60d,
+            "溢价率显示": format_premium_with_bar(premium_pct, premium_pctile_60d),
+            "RSI状态": rsi_status_label(float(rsi_val) if rsi_val is not None and not pd.isna(rsi_val) else None),
+            "RSI": round(float(rsi_val), 1) if rsi_val is not None and not pd.isna(rsi_val) else None,
             "信号准确率30d": acc,
             "错误": None,
         })

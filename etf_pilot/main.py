@@ -76,7 +76,7 @@ def _cached_build_table(records: list, days: int, ma_short: int, ma_long: int) -
     df_etf = pd.DataFrame(records)
     return _cached_build(df_etf, days=days, ma_short=ma_short, ma_long=ma_long)
 
-with st.spinner("正在拉取日线并计算行情透视、偏离度与操作建议…"):
+with st.spinner("正在拉取日线与 IOPV 实时估值，计算行情透视、偏离度、溢价率与操作建议…"):
     try:
         df_full = _cached_build_table(
             etf_list_full.to_dict("records"),
@@ -107,13 +107,48 @@ if "建议操作频率" in df_display.columns:
 # ---------- Tabs ----------
 tab_dashboard, tab_radar, tab_deep, tab_accuracy = st.tabs(["决策看板", "实时雷达", "个股深度分析", "信号准确率"])
 
+def _style_premium_column(series):
+    """溢价率列配色：>1% 红，<-1% 绿，[-1%,1%] 灰。"""
+    def cell(v):
+        if v is None or (hasattr(v, "__float__") and pd.isna(v)):
+            return ""
+        try:
+            x = float(v)
+            if x > 1:
+                return "background-color: rgba(244,67,54,0.28)"
+            if x < -1:
+                return "background-color: rgba(76,175,80,0.25)"
+            return "background-color: rgba(158,158,158,0.2)"
+        except (TypeError, ValueError):
+            return ""
+    return [cell(x) for x in series]
+
+def _style_rsi_row(row_subset):
+    """RSI 状态灯列配色：<45 青，45-70 绿，>70 橙，>80 红。按行传入 subset 的一行。"""
+    rsi = row_subset.get("RSI") if hasattr(row_subset, "get") else None
+    if rsi is None or pd.isna(rsi):
+        return ["", ""]
+    try:
+        r = float(rsi)
+        if r < 45:
+            c = "rgba(0,188,212,0.35)"
+        elif r <= 70:
+            c = "rgba(76,175,80,0.25)"
+        elif r <= 80:
+            c = "rgba(255,152,0,0.35)"
+        else:
+            c = "rgba(244,67,54,0.35)"
+        return [f"background-color: {c}", ""]
+    except (TypeError, ValueError):
+        return ["", ""]
+
 with tab_dashboard:
     st.subheader("行情透视 · 偏离度 · 明日建议（按建议操作频率排序）")
     show_cols = [
         "代码", "名称", "最新价", "涨跌幅",
         "距一年高%", "距一年低%",
         "Bias_MA20", "Bias_MA60", "Bias_MA200",
-        "明日建议", "建议操作频率", "溢价率", "信号准确率30d",
+        "明日建议", "建议操作频率", "溢价率显示", "RSI状态", "RSI", "信号准确率30d",
     ]
     show_cols = [c for c in show_cols if c in df_display.columns]
     table_df = df_display[show_cols].copy()
@@ -124,9 +159,31 @@ with tab_dashboard:
             return ["background-color: rgba(33,150,243,0.12)"] * len(row)
         if action == "套利离场":
             return ["background-color: rgba(156,39,176,0.12)"] * len(row)
+        if action in ("观望/严禁追高", "溢价极高，建议减仓或观望"):
+            return ["background-color: rgba(244,67,54,0.12)"] * len(row)
         return [""] * len(row)
 
     styled = table_df.style.apply(_row_style_simple, axis=1)
+    if "溢价率显示" in table_df.columns and "溢价率" in df_display.columns:
+        def _style_premium_display_row(row_subset):
+            idx = row_subset.name if hasattr(row_subset, "name") else None
+            pct = df_display.loc[idx, "溢价率"] if idx is not None and idx in df_display.index else row_subset.get("溢价率")
+            if pct is None or (hasattr(pct, "__float__") and pd.isna(pct)):
+                return [""]
+            try:
+                x = float(pct)
+                if x > 1:
+                    c = "background-color: rgba(244,67,54,0.28)"
+                elif x < -1:
+                    c = "background-color: rgba(76,175,80,0.25)"
+                else:
+                    c = "background-color: rgba(158,158,158,0.2)"
+                return [c]
+            except (TypeError, ValueError):
+                return [""]
+        styled = styled.apply(_style_premium_display_row, subset=["溢价率显示"], axis=1)
+    if "RSI状态" in table_df.columns and "RSI" in table_df.columns:
+        styled = styled.apply(_style_rsi_row, subset=["RSI状态", "RSI"], axis=1)
     st.dataframe(
         styled,
         use_container_width=True,
@@ -138,6 +195,8 @@ with tab_dashboard:
             "Bias_MA20": st.column_config.NumberColumn(format="%.2f%%"),
             "Bias_MA60": st.column_config.NumberColumn(format="%.2f%%"),
             "Bias_MA200": st.column_config.NumberColumn(format="%.2f%%"),
+            "溢价率显示": st.column_config.TextColumn("溢价率"),
+            "RSI": st.column_config.NumberColumn(format="%.1f"),
             "信号准确率30d": st.column_config.NumberColumn(format="%.1f%%"),
         },
         hide_index=True,
@@ -159,17 +218,39 @@ with tab_dashboard:
             st.caption(f"标的：{name}")
 
 with tab_radar:
-    st.caption("精简一览：行情透视、偏离度、明日建议、建议操作频率")
-    radar_cols = ["代码", "名称", "最新价", "涨跌幅", "距一年高%", "距一年低%", "Bias_MA20", "Bias_MA60", "Bias_MA200", "明日建议", "建议操作频率", "溢价率", "信号准确率30d"]
+    st.caption("实时行情：最新价、涨跌幅与均线/RSI 等具体数据（与决策看板不重复）")
+    radar_cols = ["代码", "名称", "最新价", "涨跌幅", "MA5", "MA20", "MA60", "MA200", "RSI"]
     radar_cols = [c for c in radar_cols if c in df_display.columns]
     radar_df = df_display[radar_cols].copy()
+    # RSI 列背景色：超跌青、安全绿、超买橙、危险红
+    def _radar_rsi_style(series):
+        def cell(v):
+            if v is None or (hasattr(v, "__float__") and pd.isna(v)):
+                return ""
+            try:
+                r = float(v)
+                if r < 45:
+                    return "background-color: rgba(0,188,212,0.2)"
+                if r <= 70:
+                    return "background-color: rgba(76,175,80,0.15)"
+                if r <= 80:
+                    return "background-color: rgba(255,152,0,0.2)"
+                return "background-color: rgba(244,67,54,0.2)"
+            except (TypeError, ValueError):
+                return ""
+        return [cell(x) for x in series]
+    radar_styled = radar_df.style.apply(_radar_rsi_style, subset=["RSI"], axis=0) if "RSI" in radar_df.columns else radar_df.style
     st.dataframe(
-        radar_df.style.apply(_row_style_simple, axis=1),
+        radar_styled,
         use_container_width=True,
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.4f"),
             "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
-            "信号准确率30d": st.column_config.NumberColumn(format="%.1f%%"),
+            "MA5": st.column_config.NumberColumn(format="%.4f"),
+            "MA20": st.column_config.NumberColumn(format="%.4f"),
+            "MA60": st.column_config.NumberColumn(format="%.4f"),
+            "MA200": st.column_config.NumberColumn(format="%.4f"),
+            "RSI": st.column_config.NumberColumn(format="%.1f"),
         },
         hide_index=True,
     )
@@ -268,6 +349,8 @@ with st.expander("📖 每日操作建议算法说明", expanded=False):
 
 - **距一年高% / 距一年低%**：当前价相对过去约 250 个交易日最高价、最低价的位置，用于判断价格所处空间。
 - **Bias_MA20 / MA60 / MA200**：价格相对三条均线的乖离率（百分比），偏离过大时需警惕回调或反弹。
-- **溢价率**：QDII ETF 估算溢价率（若数据源支持则显示），便于避免高溢价接盘。
+- **溢价率**：由 IOPV 与历史净值计算；(市价 - IOPV) / IOPV × 100%。数字后为**百分位进度条**（满格=近期最贵）。>1% 标红、<-1% 标绿、[-1%,1%] 灰色。**动态信号**：当前溢价 < 平均溢价+1% 时按技术面给建议；当前溢价 > 平均溢价×1.5 且分位>90% 时强制「溢价极高，建议减仓或观望」。
+- **RSI 状态灯**：<45 青色超跌准备买、45–70 绿色安全、>70 橙色警惕超买、>80 红色危险准备卖。
+- **自动刷新**：数据与溢价率随页面缓存（TTL）更新，开盘期间或收盘后刷新页面即可获取最新 IOPV。
 - **极端风险模拟**：侧栏可输入当前账户/持仓市值，查看若发生 15% 回撤后的金额，仅供压力测试参考。
     """)
