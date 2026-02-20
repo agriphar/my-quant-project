@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """跨境 ETF 决策辅助仪表盘：每日操作指导，不负责自动交易。"""
+import numpy as np
 import pandas as pd
 import streamlit as st
 from plotly.subplots import make_subplots
@@ -148,18 +149,37 @@ with tab_dashboard:
         "代码", "名称", "最新价", "涨跌幅",
         "距一年高%", "距一年低%",
         "Bias_MA20", "Bias_MA60", "Bias_MA200",
-        "明日建议", "建议操作频率", "溢价率显示", "RSI状态", "RSI", "信号准确率30d",
+        "明日建议", "建议操作频率", "溢价率显示", "RSI", "信号准确率显示",
     ]
     show_cols = [c for c in show_cols if c in df_display.columns]
     table_df = df_display[show_cols].copy()
+    # 溢价率处于 90% 高分位时，明日建议变红并加 ⚠️
+    if "明日建议" in table_df.columns and "溢价分位60d" in df_display.columns:
+        table_df["明日建议"] = table_df.apply(
+            lambda r: "⚠️ " + str(r["明日建议"]) if (df_display.loc[r.name, "溢价分位60d"] or 0) >= 90 else r["明日建议"],
+            axis=1,
+        )
+    table_df = table_df.replace([np.inf, -np.inf], np.nan).fillna("-")
 
     def _row_style_simple(row):
+        if "样本极少" in df_display.columns:
+            try:
+                if df_display.loc[row.name, "样本极少"] is True:
+                    return ["background-color: rgba(255,235,59,0.22)"] * len(row)
+            except (KeyError, TypeError):
+                pass
         action = row.get("明日建议") if "明日建议" in row.index else None
-        if action == "分批吸纳":
+        if isinstance(action, str) and action.startswith("⚠️ "):
+            action = action.replace("⚠️ ", "")
+        if action and isinstance(action, str) and (
+            "有效数据仅" in action or "缺少 IOPV" in action or "溢价数据不足" in action
+        ):
+            return ["background-color: rgba(255,152,0,0.2)"] * len(row)
+        if action == "强烈建议补仓":
             return ["background-color: rgba(33,150,243,0.12)"] * len(row)
-        if action == "套利离场":
+        if action == "考虑套利/减仓":
             return ["background-color: rgba(156,39,176,0.12)"] * len(row)
-        if action in ("观望/严禁追高", "溢价极高，建议减仓或观望"):
+        if action == "极度过热，禁买":
             return ["background-color: rgba(244,67,54,0.12)"] * len(row)
         return [""] * len(row)
 
@@ -182,8 +202,12 @@ with tab_dashboard:
             except (TypeError, ValueError):
                 return [""]
         styled = styled.apply(_style_premium_display_row, subset=["溢价率显示"], axis=1)
-    if "RSI状态" in table_df.columns and "RSI" in table_df.columns:
-        styled = styled.apply(_style_rsi_row, subset=["RSI状态", "RSI"], axis=1)
+    if "明日建议" in table_df.columns and "溢价分位60d" in df_display.columns:
+        def _style_明日建议_high_premium(row):
+            idx = row.name
+            pctile = df_display.loc[idx, "溢价分位60d"] if idx in df_display.index else 0
+            return ["color: #c62828; font-weight: 600;" if (pctile or 0) >= 90 else ""]
+        styled = styled.apply(_style_明日建议_high_premium, subset=["明日建议"], axis=1)
     st.dataframe(
         styled,
         use_container_width=True,
@@ -197,7 +221,7 @@ with tab_dashboard:
             "Bias_MA200": st.column_config.NumberColumn(format="%.2f%%"),
             "溢价率显示": st.column_config.TextColumn("溢价率"),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
-            "信号准确率30d": st.column_config.NumberColumn(format="%.1f%%"),
+            "信号准确率显示": st.column_config.TextColumn("准确率30d"),
         },
         hide_index=True,
     )
@@ -314,42 +338,47 @@ with tab_deep:
 with tab_accuracy:
     st.subheader("过去 30 天信号准确率")
     st.markdown("""
-    若按当日「明日建议」操作（分批吸纳视为买入、套利离场视为卖出），统计 **3 日后收益** 是否与建议一致：
-    - 建议**分批吸纳**且 3 日后**上涨** → 计为正确
-    - 建议**套利离场**且 3 日后**下跌** → 计为正确  
-    仅统计有明确买卖建议的交易日，「持有观望」不参与。准确率 = 正确次数 / 总次数。
+    - **锚定实战价格**：基于**场内收盘价 (Close)**，不使用 IOPV/净值。
+    - **有效信号**：仅统计「强烈建议补仓」「考虑套利/减仓」的样本，**持有观望不计入准确率分母**。
+    - **准确定义**：发出买入信号后 5 日内价格上涨，或发出卖出信号后 5 日内价格下跌，则视为准确。
     """)
-    acc_cols = ["代码", "名称", "明日建议", "建议操作频率", "信号准确率30d"]
+    acc_cols = ["代码", "名称", "明日建议", "建议操作频率", "信号准确率显示"]
     acc_cols = [c for c in acc_cols if c in df_display.columns]
     if acc_cols:
+        acc_df = df_display[acc_cols].copy().replace([np.inf, -np.inf], np.nan).fillna("-")
         st.dataframe(
-            df_display[acc_cols],
+            acc_df,
             use_container_width=True,
-            column_config={"信号准确率30d": st.column_config.NumberColumn(format="%.1f%%")},
+            column_config={
+                "信号准确率显示": st.column_config.TextColumn("准确率30d"),
+            },
             hide_index=True,
         )
+        st.caption("当前准确率仅基于「补仓」与「减仓」两类实战建议得出的真实胜率，维持观望不计入分母。")
 
 st.divider()
 st.caption(f"ETF 列表：{ETF_LIST_PATH}")
 
 with st.expander("📖 每日操作建议算法说明", expanded=False):
     st.markdown("""
-**操作逻辑（Action Logic）**
+**加权评分制（总分 10 分）**
 
-- **[买入补仓] 分批吸纳**  
-  当价格回落至 **MA60 附近**（上下约 2%）且 **RSI < 45** 时，标记为「分批吸纳」，适合逢低加仓。
+- **技术面 (4 分)**：RSI、Bias_MA20、距离 MA200 位置。
+- **趋势面 (3 分)**：R² 与斜率（回归拟合度与方向）。
+- **溢价面 (3 分)**：溢价分位低（便宜）给满分，高分位扣分。
 
-- **[持有观望]**  
-  当价格在均线之上平稳运行，且没有触及 MA60 吸纳区或布林上轨时，标记为「持有观望」。
+**信号输出**
 
-- **[套利卖出] 套利离场**  
-  当价格**触及布林带上轨**时，标记为「套利离场」，可考虑兑现部分利润。（若网格利润覆盖 5 倍手续费时更佳，本仪表盘以触及上轨为主要条件。）
+- 总分 **≥ 7**：**强烈建议补仓**
+- **4 ≤ 总分 < 7**：**持有观望**
+- **总分 < 4**：**考虑套利/减仓**
+- **一票否决**：**溢价偏离度** = (当前溢价 − 22 日均值) / 22 日标准差；若 **> 2.5**，无论技术分多高，强制 **极度过热，禁买**。
 
 **行情透视与偏离度**
 
 - **距一年高% / 距一年低%**：当前价相对过去约 250 个交易日最高价、最低价的位置，用于判断价格所处空间。
 - **Bias_MA20 / MA60 / MA200**：价格相对三条均线的乖离率（百分比），偏离过大时需警惕回调或反弹。
-- **溢价率**：由 IOPV 与历史净值计算；(市价 - IOPV) / IOPV × 100%。数字后为**百分位进度条**（满格=近期最贵）。>1% 标红、<-1% 标绿、[-1%,1%] 灰色。**动态信号**：当前溢价 < 平均溢价+1% 时按技术面给建议；当前溢价 > 平均溢价×1.5 且分位>90% 时强制「溢价极高，建议减仓或观望」。
+- **溢价率**：由 IOPV 与历史净值计算；(市价 - IOPV) / IOPV × 100%。数字后为**百分位进度条**（满格=近期最贵）。**相对溢价**：仅当**溢价偏离度 > 2** 视为异常过热；**> 2.5** 触发禁买。
 - **RSI 状态灯**：<45 青色超跌准备买、45–70 绿色安全、>70 橙色警惕超买、>80 红色危险准备卖。
 - **自动刷新**：数据与溢价率随页面缓存（TTL）更新，开盘期间或收盘后刷新页面即可获取最新 IOPV。
 - **极端风险模拟**：侧栏可输入当前账户/持仓市值，查看若发生 15% 回撤后的金额，仅供压力测试参考。
