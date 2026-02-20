@@ -66,7 +66,7 @@ with st.sidebar:
     if ma_short >= ma_long:
         st.warning("建议短期 < 长期")
     days = 250
-    st.caption(f"数据：最近 {days} 个交易日（含 ADX/ER 分类）· 缓存 {CACHE_TTL}s")
+    st.caption(f"数据：最近 {days} 个交易日（含 R²/斜率 趋势分类）· 缓存 {CACHE_TTL}s")
 
 # ---------- 缓存：按全量列表拉取，再按类别过滤显示 ----------
 @st.cache_data(ttl=CACHE_TTL)
@@ -138,8 +138,8 @@ def _style_pct(df: pd.DataFrame, pct_col: str = "涨跌幅"):
 tab_radar, tab_detail, tab_deep, tab_backtest = st.tabs(["实时雷达", "策略详情", "个股深度分析", "策略回测"])
 
 with tab_radar:
-    st.caption("清爽一览：代码、名称、现价、今日波动率、趋势强度(ADX)、资产性格、信号")
-    show_cols = ["代码", "名称", "最新价", "今日波动率", "趋势强度(ADX)", "资产性格", "信号"]
+    st.caption("清爽一览：代码、名称、现价、今日波动率、R²、斜率、资产性格、信号")
+    show_cols = ["代码", "名称", "最新价", "今日波动率", "R²", "斜率", "资产性格", "信号"]
     show_cols = [c for c in show_cols if c in df_display.columns]
     radar_df = df_display[show_cols].copy()
     if "最新价" in radar_df.columns:
@@ -159,14 +159,15 @@ with tab_radar:
         column_config={
             "现价": st.column_config.NumberColumn(format="%.4f"),
             "今日波动率": st.column_config.NumberColumn(format="%.2f%%"),
-            "趋势强度(ADX)": st.column_config.NumberColumn(format="%.2f"),
+            "R²": st.column_config.NumberColumn(format="%.4f"),
+            "斜率": st.column_config.NumberColumn(format="%.6f"),
         },
         hide_index=True,
     )
 
 with tab_detail:
-    st.caption("趋势强度(ADX)、资产性格、MA/RSI/布林、偏离度、信号与建议仓位")
-    detail_cols = ["代码", "名称", "趋势强度(ADX)", "资产性格", "指数简称", "最新价", "涨跌幅", "偏离度", "追高提示", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位"]
+    st.caption("R²、斜率、资产性格、MA/RSI/布林、偏离度、信号与建议仓位")
+    detail_cols = ["代码", "名称", "R²", "斜率", "资产性格", "指数简称", "最新价", "涨跌幅", "偏离度", "追高提示", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位"]
     detail_cols = [c for c in detail_cols if c in df_display.columns]
     detail_df = df_display[detail_cols]
     st.dataframe(
@@ -315,7 +316,7 @@ with tab_deep:
 with tab_backtest:
     @st.fragment
     def _backtest_fragment():
-        st.caption("步进式网格做T：按资产性格自动匹配（趋势型 80% 底仓只买不卖，震荡型 30% 底仓双向网格）。标的顺序与「个股深度分析」一致。")
+        st.caption("步进式网格做T：趋势型 80% 底仓+回撤2%补5%、回升3%波段收割；震荡型 40% 底仓双向网格。标的顺序与「个股深度分析」一致。")
         # 与个股深度分析同一选择逻辑：按 df_display 源数据顺序
         grid_options = [f"{row['名称']} ({row['代码']})" for _, row in df_display.iterrows()]
         grid_display_to_code = {f"{row['名称']} ({row['代码']})": str(row["代码"]) for _, row in df_display.iterrows()}
@@ -344,10 +345,11 @@ with tab_backtest:
                     if daily_grid.empty:
                         st.warning("回测未产生有效结果。")
                     else:
-                        # 两条线：1. 策略净值  2. 标的收盘价（基准，归一化到 100）
+                        # 策略净值、基准(归一化100)、持仓成本线(右轴)、买卖/补仓/波段收割标记；跑输时标注原因
                         close_series = series_grid.set_index("日期").reindex(daily_grid["日期"]).ffill().bfill()["收盘"]
                         base_norm = (close_series / close_series.iloc[0] * 100).values if close_series.iloc[0] and close_series.iloc[0] > 0 else None
                         nav_norm = (daily_grid["网格净值"].values / 500_000 * 100)
+                        cost_series = daily_grid["当前成本价"]
                         fig_bt = go.Figure()
                         fig_bt.add_trace(
                             go.Scatter(
@@ -368,25 +370,45 @@ with tab_backtest:
                                     line=dict(color="rgb(158, 158, 158)", width=1.5, dash="dash"),
                                 )
                             )
-                        buy_trades = [t for t in grid_trades if t.get("方向") == "买入"]
-                        sell_trades = [t for t in grid_trades if t.get("方向") == "卖出"]
+                        # 持仓成本线：右 Y 轴（元），观察随网格运行平均成本是否下移
+                        if cost_series.notna().any():
+                            fig_bt.add_trace(
+                                go.Scatter(
+                                    x=daily_grid["日期"],
+                                    y=cost_series,
+                                    mode="lines",
+                                    name="持仓成本线(元)",
+                                    line=dict(color="rgb(255, 152, 0)", width=1.5),
+                                    yaxis="y2",
+                                )
+                            )
+                        buy_trades = [t for t in grid_trades if t.get("方向") in ("买入", "补仓")]
+                        sell_trades = [t for t in grid_trades if t.get("方向") in ("卖出", "波段收割", "卖出(破趋势)")]
                         nav_by_date = daily_grid.set_index("日期")["网格净值"]
                         if buy_trades:
                             valid_b = [(t["日期"], nav_by_date.loc[t["日期"]] / 500_000 * 100) for t in buy_trades if t["日期"] in nav_by_date.index]
                             if valid_b:
-                                fig_bt.add_trace(go.Scatter(x=[p[0] for p in valid_b], y=[p[1] for p in valid_b], mode="markers", name="买入", marker=dict(symbol="circle", size=6, color="green")))
+                                fig_bt.add_trace(go.Scatter(x=[p[0] for p in valid_b], y=[p[1] for p in valid_b], mode="markers", name="买入/补仓", marker=dict(symbol="triangle-up", size=8, color="green")))
                         if sell_trades:
                             valid_s = [(t["日期"], nav_by_date.loc[t["日期"]] / 500_000 * 100) for t in sell_trades if t["日期"] in nav_by_date.index]
                             if valid_s:
-                                fig_bt.add_trace(go.Scatter(x=[p[0] for p in valid_s], y=[p[1] for p in valid_s], mode="markers", name="卖出", marker=dict(symbol="circle", size=6, color="red")))
-                        fig_bt.update_layout(
-                            title=f"网格回测：{grid_name} {grid_symbol}",
-                            xaxis_title="日期",
-                            yaxis_title="净值/基准(归一化)",
-                            height=420,
-                            template="plotly_white",
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        )
+                                fig_bt.add_trace(go.Scatter(x=[p[0] for p in valid_s], y=[p[1] for p in valid_s], mode="markers", name="卖出/波段收割", marker=dict(symbol="triangle-down", size=8, color="red")))
+                        layout_kw = {
+                            "title": f"网格回测：{grid_name} {grid_symbol}",
+                            "xaxis_title": "日期",
+                            "yaxis_title": "净值/基准(归一化)",
+                            "height": 420,
+                            "template": "plotly_white",
+                            "legend": dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        }
+                        if cost_series.notna().any():
+                            layout_kw["yaxis2"] = dict(title="持仓成本线(元)", overlaying="y", side="right", showgrid=False)
+                        underperform = metrics_grid.get("跑输原因")
+                        if underperform:
+                            layout_kw["annotations"] = [
+                                dict(text=f"跑输基准原因：{underperform}", xref="paper", yref="paper", x=0.5, y=0.95, showarrow=False, font=dict(size=14, color="crimson"))
+                            ]
+                        fig_bt.update_layout(**layout_kw)
                         st.plotly_chart(fig_bt, use_container_width=True)
 
                         # 资产性格与策略说明

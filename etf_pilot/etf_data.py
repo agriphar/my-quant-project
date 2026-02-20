@@ -115,68 +115,45 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return tr.rolling(period, min_periods=1).mean()
 
 
-# 趋势/震荡分类：ADX(14)、ER(250)
-ADX_PERIOD = 14
-ER_WINDOW = 250
-ADX_TREND_THRESHOLD = 23
-ER_TREND_THRESHOLD = 0.15
+# 趋势/震荡分类：180 日线性回归，R²>0.4 且斜率>0 为 Trend
+REGRESSION_WINDOW = 180
+R2_TREND_THRESHOLD = 0.4
 ASSET_TREND = "Trend (趋势型)"
 ASSET_OSCILLATING = "Oscillating (震荡型)"
 
 
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = ADX_PERIOD) -> pd.Series:
-    """ADX(14)：Wilder 平滑的 +DM/-DM/TR -> +DI/-DI -> DX -> ADX。"""
-    prev_high = high.shift(1)
-    prev_low = low.shift(1)
-    prev_close = close.shift(1)
-    up_move = high - prev_high
-    down_move = prev_low - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-    # Wilder 平滑：alpha = 1/period
-    alpha = 1.0 / period
-    smooth_tr = pd.Series(tr, index=close.index).ewm(alpha=alpha, adjust=False).mean()
-    smooth_plus_dm = pd.Series(plus_dm, index=close.index).ewm(alpha=alpha, adjust=False).mean()
-    smooth_minus_dm = pd.Series(minus_dm, index=close.index).ewm(alpha=alpha, adjust=False).mean()
-    plus_di = 100 * smooth_plus_dm / smooth_tr.replace(0, np.nan)
-    minus_di = 100 * smooth_minus_dm / smooth_tr.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.ewm(alpha=alpha, adjust=False).mean()
-    return adx
-
-
-def _efficiency_ratio(close: pd.Series, window: int = ER_WINDOW) -> float:
-    """ER = |当前价 - window日前价| / sum(每日波动绝对值)。"""
+def _linear_regression_r2_slope(close: pd.Series, window: int = REGRESSION_WINDOW) -> tuple:
+    """过去 window 日收盘价的线性回归，返回 (R², 斜率)。斜率 = 每日价格变动（元/日）。"""
     if close is None or len(close) < window:
-        return 0.0
-    c = close.iloc[-window:]
-    net = abs(c.iloc[-1] - c.iloc[0])
-    if net == 0:
-        return 0.0
-    daily_changes = c.diff().abs().dropna()
-    total = daily_changes.sum()
-    if total == 0:
-        return 0.0
-    return float(net / total)
+        return None, None
+    y = close.iloc[-window:].values.astype(float)
+    if np.any(np.isnan(y)) or np.var(y) == 0:
+        return None, None
+    x = np.arange(len(y), dtype=float)
+    n = len(x)
+    x_mean = x.mean()
+    y_mean = y.mean()
+    ss_xy = np.sum((x - x_mean) * (y - y_mean))
+    ss_xx = np.sum((x - x_mean) ** 2)
+    ss_yy = np.sum((y - y_mean) ** 2)
+    if ss_xx == 0 or ss_yy == 0:
+        return None, None
+    slope = ss_xy / ss_xx
+    r_squared = (ss_xy ** 2) / (ss_xx * ss_yy) if (ss_xx * ss_yy) > 0 else 0.0
+    return float(r_squared), float(slope)
 
 
 def compute_trend_classification(hist: pd.DataFrame) -> tuple:
-    """根据过去 250 日计算 ADX(14)、ER；ADX>23 且 ER>0.15 为 Trend，否则 Oscillating。返回 (adx_last, er, 资产性格)。"""
-    if hist is None or len(hist) < ER_WINDOW or "收盘" not in hist.columns:
+    """根据过去 180 日线性回归：R²>0.4 且斜率>0 为 Trend，否则 Oscillating。返回 (r2, slope, 资产性格)。"""
+    if hist is None or len(hist) < REGRESSION_WINDOW or "收盘" not in hist.columns:
         return None, None, None
     close = hist["收盘"]
-    high = hist["最高"] if "最高" in hist.columns else close
-    low = hist["最低"] if "最低" in hist.columns else close
-    last_250 = hist.tail(ER_WINDOW)
-    adx_s = _adx(last_250["最高"], last_250["最低"], last_250["收盘"], ADX_PERIOD)
-    adx_last = float(adx_s.iloc[-1]) if len(adx_s) and pd.notna(adx_s.iloc[-1]) else None
-    er = _efficiency_ratio(close.tail(ER_WINDOW), ER_WINDOW)
-    if adx_last is not None and er is not None:
-        personality = ASSET_TREND if (adx_last > ADX_TREND_THRESHOLD and er > ER_TREND_THRESHOLD) else ASSET_OSCILLATING
+    r2, slope = _linear_regression_r2_slope(close, REGRESSION_WINDOW)
+    if r2 is not None and slope is not None:
+        personality = ASSET_TREND if (r2 > R2_TREND_THRESHOLD and slope > 0) else ASSET_OSCILLATING
     else:
         personality = None
-    return adx_last, er, personality
+    return r2, slope, personality
 
 
 def fetch_etf_daily(
@@ -217,7 +194,7 @@ def fetch_etf_daily(
         df["最高"] = df["收盘"]
     if "最低" not in df.columns:
         df["最低"] = df["收盘"]
-    df = df.sort_values("日期").tail(max(days + 30, ER_WINDOW)).reset_index(drop=True)
+    df = df.sort_values("日期").tail(max(days + 30, REGRESSION_WINDOW)).reset_index(drop=True)
     close = df["收盘"]
     df["MA_short"] = close.rolling(ma_short, min_periods=1).mean()
     df["MA_long"] = close.rolling(ma_long, min_periods=1).mean()
@@ -269,7 +246,7 @@ def build_monitor_table_advanced(
         if hist is None or hist.empty:
             rows.append({
                 "代码": code, "名称": name, "指数简称": category,
-                "趋势强度(ADX)": None, "资产性格": None,
+                "R²": None, "斜率": None, "资产性格": None,
                 "最新价": None, "涨跌幅": None, "MA_short": None, "MA_long": None,
                 "RSI": None, "BB_lower": None, "偏离度": None, "追高提示": "", "补仓建议": "",
                 "信号": "—", "建议仓位": "—",
@@ -281,7 +258,7 @@ def build_monitor_table_advanced(
         close = last["收盘"]
         prev_close = prev["收盘"]
         pct = (float((close - prev_close) / prev_close * 100)) if prev_close and prev_close != 0 else None
-        adx_last, er, personality = compute_trend_classification(hist)
+        r2, slope, personality = compute_trend_classification(hist)
         center_30 = hist["收盘"].tail(30).mean()
         signal = compute_grid_signal(
             float(close) if close is not None else None,
@@ -295,7 +272,8 @@ def build_monitor_table_advanced(
             volatilities.append(vol)
         rows.append({
             "代码": code, "名称": name, "指数简称": category,
-            "趋势强度(ADX)": round(adx_last, 2) if adx_last is not None else None,
+            "R²": round(r2, 4) if r2 is not None else None,
+            "斜率": round(slope, 6) if slope is not None else None,
             "资产性格": personality or "—",
             "最新价": round(float(close), 4),
             "涨跌幅": round(pct, 2) if pct is not None else None,
