@@ -108,41 +108,6 @@ if "建议操作频率" in df_display.columns:
 # ---------- Tabs ----------
 tab_dashboard, tab_radar, tab_deep, tab_accuracy = st.tabs(["决策看板", "实时雷达", "个股深度分析", "信号准确率"])
 
-def _style_premium_column(series):
-    """溢价率列配色：>1% 红，<-1% 绿，[-1%,1%] 灰。"""
-    def cell(v):
-        if v is None or (hasattr(v, "__float__") and pd.isna(v)):
-            return ""
-        try:
-            x = float(v)
-            if x > 1:
-                return "background-color: rgba(244,67,54,0.28)"
-            if x < -1:
-                return "background-color: rgba(76,175,80,0.25)"
-            return "background-color: rgba(158,158,158,0.2)"
-        except (TypeError, ValueError):
-            return ""
-    return [cell(x) for x in series]
-
-def _style_rsi_row(row_subset):
-    """RSI 状态灯列配色：<45 青，45-70 绿，>70 橙，>80 红。按行传入 subset 的一行。"""
-    rsi = row_subset.get("RSI") if hasattr(row_subset, "get") else None
-    if rsi is None or pd.isna(rsi):
-        return ["", ""]
-    try:
-        r = float(rsi)
-        if r < 45:
-            c = "rgba(0,188,212,0.35)"
-        elif r <= 70:
-            c = "rgba(76,175,80,0.25)"
-        elif r <= 80:
-            c = "rgba(255,152,0,0.35)"
-        else:
-            c = "rgba(244,67,54,0.35)"
-        return [f"background-color: {c}", ""]
-    except (TypeError, ValueError):
-        return ["", ""]
-
 with tab_dashboard:
     st.subheader("行情透视 · 偏离度 · 明日建议（按建议操作频率排序）")
     show_cols = [
