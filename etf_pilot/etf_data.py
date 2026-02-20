@@ -7,12 +7,8 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 
-from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD, GRID_SYMBOL_DEFAULT
-from strategy import (
-    compute_deviation,
-    check_chase_high,
-    compute_grid_signal,
-)
+from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD
+from strategy import compute_deviation, check_chase_high
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 ETF_LIST_PATH = DATA_DIR / "ETF汇总.xlsx"
@@ -121,6 +117,14 @@ R2_TREND_THRESHOLD = 0.4
 ASSET_TREND = "Trend (趋势型)"
 ASSET_OSCILLATING = "Oscillating (震荡型)"
 
+# 每日操作建议算法
+TRADING_DAYS_1Y = 250
+MA60_NEAR_PCT = 0.02      # 价格在 MA60 上下 2% 内视为「MA60 附近」
+RSI_ADDON_MAX = 45        # RSI < 45 视为可分批吸纳
+BB_UPPER_TOUCH = 0.998    # 收盘 >= 布林上轨*此系数视为触及上轨
+SIGNAL_FWD_DAYS = 3       # 信号准确率：看 N 日后收益
+SIGNAL_LOOKBACK_DAYS = 30 # 过去 30 天统计准确率
+
 
 def _linear_regression_r2_slope(close: pd.Series, window: int = REGRESSION_WINDOW) -> tuple:
     """过去 window 日收盘价的线性回归，返回 (R², 斜率)。斜率 = 每日价格变动（元/日）。"""
@@ -154,6 +158,111 @@ def compute_trend_classification(hist: pd.DataFrame) -> tuple:
     else:
         personality = None
     return r2, slope, personality
+
+
+def _pct_from_1y_high_low(hist: pd.DataFrame) -> tuple:
+    """距一年内最高点、最低点的百分比。返回 (距最高点%, 距最低点%)。"""
+    if hist is None or len(hist) < 20 or "收盘" not in hist.columns:
+        return None, None
+    window = hist["收盘"].tail(TRADING_DAYS_1Y)
+    high_1y = window.max()
+    low_1y = window.min()
+    close = hist["收盘"].iloc[-1]
+    if pd.isna(close) or close <= 0:
+        return None, None
+    pct_from_high = (float(high_1y - close) / float(high_1y) * 100) if high_1y and high_1y > 0 else None
+    pct_from_low = (float(close - low_1y) / float(low_1y) * 100) if low_1y and low_1y > 0 else None
+    return pct_from_high, pct_from_low
+
+
+def _bias_pct(price: float | None, ma: float | None) -> float | None:
+    """乖离率：(price - ma) / ma * 100。"""
+    if price is None or ma is None or pd.isna(ma) or ma == 0:
+        return None
+    return round((float(price) - float(ma)) / float(ma) * 100, 2)
+
+
+def compute_daily_action(last: pd.Series) -> tuple:
+    """
+    每日操作建议：返回 (操作, 理由)。
+    操作: 分批吸纳 / 套利离场 / 持有观望。
+    - 分批吸纳：价格回落至 MA60 附近且 RSI < 45
+    - 套利离场：价格触及布林带上轨（若网格利润覆盖 5 倍手续费更佳，此处简化为触及上轨）
+    - 持有观望：其余
+    """
+    close = last.get("收盘")
+    ma60 = last.get("MA60")
+    rsi = last.get("RSI")
+    bb_upper = last.get("BB_upper")
+    if close is None or pd.isna(close):
+        return "持有观望", "数据不足"
+    if ma60 is not None and not pd.isna(ma60) and ma60 > 0:
+        near_ma60 = abs(float(close) - float(ma60)) / float(ma60) <= MA60_NEAR_PCT
+        if near_ma60 and rsi is not None and not pd.isna(rsi) and rsi < RSI_ADDON_MAX:
+            return "分批吸纳", "价格回落至MA60附近且RSI<45，适合分批吸纳"
+    if bb_upper is not None and not pd.isna(bb_upper) and bb_upper > 0:
+        if float(close) >= float(bb_upper) * BB_UPPER_TOUCH:
+            return "套利离场", "价格触及布林带上轨，可考虑套利离场"
+    return "持有观望", "价格在均线之上平稳运行，无极值信号"
+
+
+def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAYS) -> int:
+    """过去 N 天内「分批吸纳」或「套利离场」出现次数，用于排序（建议操作频率）。"""
+    if hist is None or len(hist) < 2 or "收盘" not in hist.columns:
+        return 0
+    need = ["收盘", "MA60", "RSI", "BB_upper"]
+    if not all(c in hist.columns for c in need):
+        return 0
+    tail = hist.tail(days)
+    count = 0
+    for _, row in tail.iterrows():
+        act, _ = compute_daily_action(row)
+        if act in ("分批吸纳", "套利离场"):
+            count += 1
+    return count
+
+
+def compute_signal_accuracy_30d(hist: pd.DataFrame) -> float | None:
+    """
+    过去 30 天信号准确率：若按当日建议操作，看 3 日后收益是否一致。
+    买入(分批吸纳)且 3 日后涨 -> 正确；卖出(套利离场)且 3 日后跌 -> 正确；持有不参与统计。
+    返回 0~100 的准确率，无有效样本时返回 None。
+    """
+    if hist is None or len(hist) < SIGNAL_LOOKBACK_DAYS + SIGNAL_FWD_DAYS + 5:
+        return None
+    need = ["收盘", "MA60", "RSI", "BB_upper"]
+    if not all(c in hist.columns for c in need):
+        return None
+    close = hist["收盘"].reset_index(drop=True)
+    correct = 0
+    total = 0
+    for i in range(len(hist) - SIGNAL_FWD_DAYS):
+        if i + SIGNAL_FWD_DAYS >= len(hist):
+            break
+        row = hist.iloc[i]
+        act, _ = compute_daily_action(row)
+        if act == "持有观望":
+            continue
+        p0 = close.iloc[i]
+        p3 = close.iloc[i + SIGNAL_FWD_DAYS]
+        if p0 is None or p0 <= 0 or pd.isna(p0) or pd.isna(p3):
+            continue
+        ret3 = (float(p3) - float(p0)) / float(p0)
+        total += 1
+        if act == "分批吸纳" and ret3 > 0:
+            correct += 1
+        elif act == "套利离场" and ret3 < 0:
+            correct += 1
+    if total == 0:
+        return None
+    return round(correct / total * 100, 1)
+
+
+def drawdown_15pct_value(current_value: float) -> float:
+    """极端风险模拟：若标的发生 15% 回撤，账户会变成多少。"""
+    if current_value is None or pd.isna(current_value) or current_value < 0:
+        return 0.0
+    return round(float(current_value) * (1 - 0.15), 2)
 
 
 def fetch_etf_daily(
@@ -207,19 +316,9 @@ def fetch_etf_daily(
     return df
 
 
-def _suggested_position(volatility: float, volatilities: list[float]) -> str:
-    """根据波动率：波动大仓位轻，平稳仓位重。"""
-    if not volatilities or volatility is None or pd.isna(volatility):
-        return "—"
-    arr = np.array([v for v in volatilities if v is not None and not pd.isna(v)])
-    if len(arr) == 0:
-        return "—"
-    pct = (arr < volatility).mean() * 100
-    if pct >= 75:
-        return "高(60-80%)"
-    if pct >= 40:
-        return "中(40-60%)"
-    return "低(20-40%)"
+def _qdii_premium_placeholder(_code: str) -> str:
+    """QDII ETF 溢价率：接口允许时填入，否则返回占位。"""
+    return "—"
 
 
 def build_monitor_table_advanced(
@@ -229,27 +328,29 @@ def build_monitor_table_advanced(
     ma_long: int = 20,
     fetcher: Callable[[str, int, int, int], pd.DataFrame | None] | None = None,
 ) -> pd.DataFrame:
-    """拉取日线、计算指标与建议仓位；单只失败则该行填错误信息不崩溃。"""
+    """拉取日线，计算行情透视、偏离度、每日操作建议与建议操作频率；单只失败则该行填错误。"""
     get_hist = fetcher or (lambda s, d, ms, ml: fetch_etf_daily(s, d, ms, ml))
     rows = []
-    volatilities: list[float] = []
     for _, row in etf_list.iterrows():
         code = str(row["代码"]).strip()
         name = row.get("名称", code)
         category = row.get("指数简称", "其他")
         err_msg = None
         try:
-            hist = get_hist(code, days, ma_short, ma_long)
+            hist = get_hist(code, max(days, SIGNAL_LOOKBACK_DAYS + 10), ma_short, ma_long)
         except Exception as e:
             hist = None
             err_msg = str(e)[:80]
         if hist is None or hist.empty:
             rows.append({
                 "代码": code, "名称": name, "指数简称": category,
-                "R²": None, "斜率": None, "资产性格": None,
-                "最新价": None, "涨跌幅": None, "MA_short": None, "MA_long": None,
-                "RSI": None, "BB_lower": None, "偏离度": None, "追高提示": "", "补仓建议": "",
-                "信号": "—", "建议仓位": "—",
+                "最新价": None, "涨跌幅": None,
+                "距一年高%": None, "距一年低%": None,
+                "Bias_MA20": None, "Bias_MA60": None, "Bias_MA200": None,
+                "明日建议": "—", "建议理由": "",
+                "建议操作频率": 0,
+                "溢价率": _qdii_premium_placeholder(code),
+                "信号准确率30d": None,
                 "错误": err_msg or "获取失败",
             })
             continue
@@ -258,42 +359,26 @@ def build_monitor_table_advanced(
         close = last["收盘"]
         prev_close = prev["收盘"]
         pct = (float((close - prev_close) / prev_close * 100)) if prev_close and prev_close != 0 else None
-        r2, slope, personality = compute_trend_classification(hist)
-        center_30 = hist["收盘"].tail(30).mean()
-        signal = compute_grid_signal(
-            float(close) if close is not None else None,
-            float(center_30) if pd.notna(center_30) and center_30 > 0 else None,
-        )
-        dev_pct = compute_deviation(float(close) if close is not None else None, float(last["MA20"]) if last.get("MA20") is not None else None)
-        chase = check_chase_high(dev_pct)
-        ret = hist["收盘"].pct_change().dropna().tail(20)
-        vol = float(ret.std()) if len(ret) > 0 else None
-        if vol is not None:
-            volatilities.append(vol)
+        pct_high, pct_low = _pct_from_1y_high_low(hist)
+        bias_20 = _bias_pct(float(close) if close is not None else None, last.get("MA20"))
+        bias_60 = _bias_pct(float(close) if close is not None else None, last.get("MA60"))
+        bias_200 = _bias_pct(float(close) if close is not None else None, last.get("MA200"))
+        action, reason = compute_daily_action(last)
+        freq = compute_action_frequency(hist, SIGNAL_LOOKBACK_DAYS)
+        acc = compute_signal_accuracy_30d(hist)
         rows.append({
             "代码": code, "名称": name, "指数简称": category,
-            "R²": round(r2, 4) if r2 is not None else None,
-            "斜率": round(slope, 6) if slope is not None else None,
-            "资产性格": personality or "—",
             "最新价": round(float(close), 4),
             "涨跌幅": round(pct, 2) if pct is not None else None,
-            "MA_short": round(float(last["MA_short"]), 4) if last.get("MA_short") is not None else None,
-            "MA_long": round(float(last["MA_long"]), 4) if last.get("MA_long") is not None else None,
-            "RSI": round(float(last["RSI"]), 1) if last.get("RSI") is not None and not pd.isna(last["RSI"]) else None,
-            "BB_lower": round(float(last["BB_lower"]), 4) if last.get("BB_lower") is not None and not pd.isna(last.get("BB_lower")) else None,
-            "偏离度": dev_pct,
-            "追高提示": chase,
-            "补仓建议": "",
-            "信号": signal,
-            "建议仓位": None,
+            "距一年高%": round(pct_high, 2) if pct_high is not None else None,
+            "距一年低%": round(pct_low, 2) if pct_low is not None else None,
+            "Bias_MA20": bias_20, "Bias_MA60": bias_60, "Bias_MA200": bias_200,
+            "明日建议": action, "建议理由": reason,
+            "建议操作频率": freq,
+            "溢价率": _qdii_premium_placeholder(code),
+            "信号准确率30d": acc,
             "错误": None,
-            "今日波动率": round(float(vol) * 100, 2) if vol is not None and not pd.isna(vol) else None,
-            "_vol": vol,
         })
-    for r in rows:
-        if r.get("建议仓位") is None and r.get("错误") is None:
-            r["建议仓位"] = _suggested_position(r.pop("_vol", None), volatilities)
-        r.pop("_vol", None)
     return pd.DataFrame(rows)
 
 

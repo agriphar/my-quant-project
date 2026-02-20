@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""A 股跨境 ETF 监控工具 - Streamlit 入口（架构升级版）。"""
+"""跨境 ETF 决策辅助仪表盘：每日操作指导，不负责自动交易。"""
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 from config import (
     MA_SHORT_DEFAULT,
@@ -17,17 +17,14 @@ from etf_data import (
     build_monitor_table_advanced,
     fetch_etf_daily,
     get_etf_hist_for_chart,
-    fetch_etf_hist_for_backtest,
     ETF_LIST_PATH,
     ensure_data_dir,
-    ASSET_TREND,
-    ASSET_OSCILLATING,
+    drawdown_15pct_value,
 )
-from strategy.grid_backtest import run_grid_backtest
-from config.settings import BACKTEST_YEARS
 
-st.set_page_config(page_title="跨境 ETF 监控", page_icon="📈", layout="wide")
-st.title("📈 A 股跨境 ETF 监控")
+st.set_page_config(page_title="跨境 ETF 决策辅助", page_icon="📊", layout="wide")
+st.title("📊 跨境 ETF 决策辅助仪表盘")
+st.caption("仅提供每日操作指导，不构成自动交易。")
 
 ensure_data_dir()
 etf_list_full = load_etf_list()
@@ -38,7 +35,6 @@ if etf_list_full.empty:
 # ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("筛选与参数")
-    # 类别过滤
     category_options = [CATEGORY_ALL] + list(CATEGORY_KEYWORDS.keys())
     selected_category = st.selectbox(
         "ETF 类别",
@@ -46,32 +42,28 @@ with st.sidebar:
         index=0,
         help="按指数/主题筛选 ETF",
     )
-    # MA 参数
-    ma_short = st.number_input(
-        "MA 短期",
-        min_value=3,
-        max_value=60,
-        value=MA_SHORT_DEFAULT,
-        step=1,
-        help="短期均线周期",
-    )
-    ma_long = st.number_input(
-        "MA 长期",
-        min_value=5,
-        max_value=120,
-        value=MA_LONG_DEFAULT,
-        step=1,
-        help="长期均线周期",
-    )
+    ma_short = st.number_input("MA 短期", min_value=3, max_value=60, value=MA_SHORT_DEFAULT, step=1)
+    ma_long = st.number_input("MA 长期", min_value=5, max_value=120, value=MA_LONG_DEFAULT, step=1)
     if ma_short >= ma_long:
         st.warning("建议短期 < 长期")
     days = 250
-    st.caption(f"数据：最近 {days} 个交易日（含 R²/斜率 趋势分类）· 缓存 {CACHE_TTL}s")
+    st.caption(f"数据：最近 {days} 个交易日 · 缓存 {CACHE_TTL}s")
 
-# ---------- 缓存：按全量列表拉取，再按类别过滤显示 ----------
+    st.subheader("极端风险模拟")
+    account_value = st.number_input(
+        "当前账户/持仓市值（元）",
+        min_value=0,
+        value=100000,
+        step=10000,
+        help="用于估算若标的发生 15% 回撤后的账户金额",
+    )
+    if account_value > 0:
+        after_drawdown = drawdown_15pct_value(account_value)
+        st.metric("若发生 15% 回撤后", f"¥{after_drawdown:,.0f}", None)
+
+# ---------- 缓存拉取与建表 ----------
 @st.cache_data(ttl=CACHE_TTL)
 def _cached_fetch(symbol: str, days: int, ma_short: int, ma_long: int):
-    """单只 ETF 日线+指标，避免重复请求 AkShare。"""
     return fetch_etf_daily(symbol, days=days, ma_short=ma_short, ma_long=ma_long)
 
 def _cached_build(etf_df: pd.DataFrame, days: int, ma_short: int, ma_long: int) -> pd.DataFrame:
@@ -80,11 +72,11 @@ def _cached_build(etf_df: pd.DataFrame, days: int, ma_short: int, ma_long: int) 
     return build_monitor_table_advanced(etf_df, days=days, ma_short=ma_short, ma_long=ma_long, fetcher=fetcher)
 
 @st.cache_data(ttl=CACHE_TTL)
-def _cached_build_table(records: list[dict], days: int, ma_short: int, ma_long: int) -> pd.DataFrame:
+def _cached_build_table(records: list, days: int, ma_short: int, ma_long: int) -> pd.DataFrame:
     df_etf = pd.DataFrame(records)
     return _cached_build(df_etf, days=days, ma_short=ma_short, ma_long=ma_long)
 
-with st.spinner("正在拉取日线并计算指标（RSI/布林带/多因子信号）…"):
+with st.spinner("正在拉取日线并计算行情透视、偏离度与操作建议…"):
     try:
         df_full = _cached_build_table(
             etf_list_full.to_dict("records"),
@@ -96,421 +88,186 @@ with st.spinner("正在拉取日线并计算指标（RSI/布林带/多因子信�
         st.error(f"拉取数据失败：{e}")
         st.stop()
 
-# 按类别过滤
 if selected_category != CATEGORY_ALL and selected_category in CATEGORY_KEYWORDS:
     keywords = CATEGORY_KEYWORDS[selected_category]
-    mask = df_full["指数简称"].astype(str).str.contains(
-        "|".join(keywords), case=False, na=False
-    )
+    mask = df_full["指数简称"].astype(str).str.contains("|".join(keywords), case=False, na=False)
     df = df_full.loc[mask]
 else:
     df = df_full
 
 if df.empty:
-    st.warning(f"类别「{selected_category}」下暂无 ETF，请切换类别或检查 data/ETF汇总.xlsx。")
+    st.warning(f"类别「{selected_category}」下暂无 ETF。")
     st.stop()
 
-# 过滤掉仅因错误而存在的行（可选：在表格中保留并显示错误列）
+# 按「建议操作频率」降序排序，便于优先看到需要操作的标的
 df_display = df.copy()
-# 信号列显示为 Emoji + 文字
-df_display["信号"] = df_display["信号"].map({
-    "买入": "🚀 买入",
-    "持有": "🛡️ 持有",
-    "减仓": "⚠️ 减仓",
-}).fillna(df_display["信号"])
-
-def _style_pct(df: pd.DataFrame, pct_col: str = "涨跌幅"):
-    """对 DataFrame 的涨跌幅列加颜色热力图。"""
-    if pct_col not in df.columns or df[pct_col].notna().sum() == 0:
-        return df.style
-    pct_min = df[pct_col].min()
-    pct_max = df[pct_col].max()
-    if pd.notna(pct_min) and pd.notna(pct_max) and pct_max > pct_min:
-        return df.style.background_gradient(
-            subset=[pct_col],
-            cmap="RdYlGn",
-            vmin=pct_min,
-            vmax=pct_max,
-        )
-    return df.style
+if "建议操作频率" in df_display.columns:
+    df_display = df_display.sort_values("建议操作频率", ascending=False).reset_index(drop=True)
 
 # ---------- Tabs ----------
-tab_radar, tab_detail, tab_deep, tab_backtest = st.tabs(["实时雷达", "策略详情", "个股深度分析", "策略回测"])
+tab_dashboard, tab_radar, tab_deep, tab_accuracy = st.tabs(["决策看板", "实时雷达", "个股深度分析", "信号准确率"])
 
-with tab_radar:
-    st.caption("清爽一览：代码、名称、现价、今日波动率、R²、斜率、资产性格、信号")
-    show_cols = ["代码", "名称", "最新价", "今日波动率", "R²", "斜率", "资产性格", "信号"]
+with tab_dashboard:
+    st.subheader("行情透视 · 偏离度 · 明日建议（按建议操作频率排序）")
+    show_cols = [
+        "代码", "名称", "最新价", "涨跌幅",
+        "距一年高%", "距一年低%",
+        "Bias_MA20", "Bias_MA60", "Bias_MA200",
+        "明日建议", "建议操作频率", "溢价率", "信号准确率30d",
+    ]
     show_cols = [c for c in show_cols if c in df_display.columns]
-    radar_df = df_display[show_cols].copy()
-    if "最新价" in radar_df.columns:
-        radar_df = radar_df.rename(columns={"最新价": "现价"})
-    # 趋势型蓝色、震荡型紫色
-    def _row_style(row):
-        p = row.get("资产性格") if "资产性格" in row.index else None
-        if p == ASSET_TREND:
-            return ["background-color: rgba(33,150,243,0.15)"] * len(row)
-        if p == ASSET_OSCILLATING:
-            return ["background-color: rgba(156,39,176,0.15)"] * len(row)
+    table_df = df_display[show_cols].copy()
+
+    def _row_style_simple(row):
+        action = row.get("明日建议") if "明日建议" in row.index else None
+        if action == "分批吸纳":
+            return ["background-color: rgba(33,150,243,0.12)"] * len(row)
+        if action == "套利离场":
+            return ["background-color: rgba(156,39,176,0.12)"] * len(row)
         return [""] * len(row)
-    styled = radar_df.style.apply(_row_style, axis=1)
+
+    styled = table_df.style.apply(_row_style_simple, axis=1)
     st.dataframe(
         styled,
         use_container_width=True,
         column_config={
-            "现价": st.column_config.NumberColumn(format="%.4f"),
-            "今日波动率": st.column_config.NumberColumn(format="%.2f%%"),
-            "R²": st.column_config.NumberColumn(format="%.4f"),
-            "斜率": st.column_config.NumberColumn(format="%.6f"),
+            "最新价": st.column_config.NumberColumn(format="%.4f"),
+            "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
+            "距一年高%": st.column_config.NumberColumn(format="%.2f%%"),
+            "距一年低%": st.column_config.NumberColumn(format="%.2f%%"),
+            "Bias_MA20": st.column_config.NumberColumn(format="%.2f%%"),
+            "Bias_MA60": st.column_config.NumberColumn(format="%.2f%%"),
+            "Bias_MA200": st.column_config.NumberColumn(format="%.2f%%"),
+            "信号准确率30d": st.column_config.NumberColumn(format="%.1f%%"),
         },
         hide_index=True,
     )
 
-with tab_detail:
-    st.caption("R²、斜率、资产性格、MA/RSI/布林、偏离度、信号与建议仓位")
-    detail_cols = ["代码", "名称", "R²", "斜率", "资产性格", "指数简称", "最新价", "涨跌幅", "偏离度", "追高提示", "MA_short", "MA_long", "RSI", "BB_lower", "信号", "建议仓位"]
-    detail_cols = [c for c in detail_cols if c in df_display.columns]
-    detail_df = df_display[detail_cols]
+    st.subheader("点击查看明日操作卡片")
+    card_options = [f"{row['名称']} ({row['代码']})" for _, row in df_display.iterrows()]
+    card_display_to_code = {f"{row['名称']} ({row['代码']})": str(row["代码"]) for _, row in df_display.iterrows()}
+    selected_display = st.selectbox("选择 ETF", options=card_options, key="card_select")
+    if selected_display:
+        code = card_display_to_code.get(selected_display)
+        sel_mask = df_display["代码"].astype(str) == code
+        if code and sel_mask.any():
+            sel_row = df_display.loc[sel_mask].iloc[0]
+            action = sel_row.get("明日建议", "持有观望")
+            reason = sel_row.get("建议理由", "")
+            name = sel_row.get("名称", "")
+            st.info(f"**明天建议：{action}**  \n理由：{reason}")
+            st.caption(f"标的：{name}")
+
+with tab_radar:
+    st.caption("精简一览：行情透视、偏离度、明日建议、建议操作频率")
+    radar_cols = ["代码", "名称", "最新价", "涨跌幅", "距一年高%", "距一年低%", "Bias_MA20", "Bias_MA60", "Bias_MA200", "明日建议", "建议操作频率", "溢价率", "信号准确率30d"]
+    radar_cols = [c for c in radar_cols if c in df_display.columns]
+    radar_df = df_display[radar_cols].copy()
     st.dataframe(
-        _style_pct(detail_df),
+        radar_df.style.apply(_row_style_simple, axis=1),
         use_container_width=True,
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.4f"),
             "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
-            "偏离度": st.column_config.NumberColumn(format="%.2f"),
-            "MA_short": st.column_config.NumberColumn(format="%.4f"),
-            "MA_long": st.column_config.NumberColumn(format="%.4f"),
-            "RSI": st.column_config.NumberColumn(format="%.1f"),
-            "BB_lower": st.column_config.NumberColumn(format="%.4f"),
+            "信号准确率30d": st.column_config.NumberColumn(format="%.1f%%"),
         },
         hide_index=True,
     )
-    if "错误" in df.columns and df["错误"].notna().any():
-        st.warning("部分标的获取失败，见下方错误信息。")
-        err_df = df.loc[df["错误"].notna(), ["代码", "名称", "错误"]]
-        st.dataframe(err_df, use_container_width=True, hide_index=True)
 
 with tab_deep:
     @st.fragment
     def _deep_fragment():
-        st.caption("选择一只 ETF，查看带均线与布林带的交互式 K 线图")
+        st.caption("选择一只 ETF，查看带均线与布林带的 K 线图")
         options = [f"{row['名称']} ({row['代码']})" for _, row in df_display.iterrows()]
         display_to_code = {f"{row['名称']} ({row['代码']})": str(row["代码"]) for _, row in df_display.iterrows()}
         selected_display = st.selectbox("选择标的", options=options, key="deep_select")
-        if selected_display:
-            code = display_to_code.get(selected_display)
-            if code:
-                with st.spinner("拉取 K 线数据…"):
-                    chart_df = get_etf_hist_for_chart(
-                        symbol=code,
-                        days=60,
-                        ma_short=int(ma_short),
-                        ma_long=int(ma_long),
+        if selected_display and selected_display in display_to_code:
+            code = display_to_code[selected_display]
+            with st.spinner("拉取 K 线数据…"):
+                chart_df = get_etf_hist_for_chart(symbol=code, days=60, ma_short=int(ma_short), ma_long=int(ma_long))
+            if chart_df is None or chart_df.empty:
+                st.warning("该标的 K 线数据获取失败。")
+            else:
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.06,
+                    row_heights=[0.75, 0.25],
+                    subplot_titles=(selected_display, "成交量"),
+                )
+                if all(c in chart_df.columns for c in ["开盘", "最高", "最低", "收盘"]):
+                    fig.add_trace(
+                        go.Candlestick(
+                            x=chart_df["日期"], open=chart_df["开盘"], high=chart_df["最高"],
+                            low=chart_df["最低"], close=chart_df["收盘"], name="K线",
+                        ),
+                        row=1, col=1,
                     )
-                if chart_df is None or chart_df.empty:
-                    st.warning("该标的 K 线数据获取失败，请稍后重试。")
                 else:
-                    fig = make_subplots(
-                        rows=2,
-                        cols=1,
-                        shared_xaxes=True,
-                        vertical_spacing=0.06,
-                        row_heights=[0.75, 0.25],
-                        subplot_titles=(selected_display, "成交量"),
+                    fig.add_trace(
+                        go.Scatter(x=chart_df["日期"], y=chart_df["收盘"], mode="lines", name="收盘", line=dict(color="blue", width=2)),
+                        row=1, col=1,
                     )
-                    # K 线（需开盘、高、低、收）
-                    if all(c in chart_df.columns for c in ["开盘", "最高", "最低", "收盘"]):
+                for col, label in [("MA_short", f"MA{ma_short}"), ("MA_long", f"MA{ma_long}")]:
+                    if col in chart_df.columns:
                         fig.add_trace(
-                            go.Candlestick(
-                                x=chart_df["日期"],
-                                open=chart_df["开盘"],
-                                high=chart_df["最高"],
-                                low=chart_df["最低"],
-                                close=chart_df["收盘"],
-                                name="K线",
-                            ),
-                            row=1,
-                            col=1,
+                            go.Scatter(x=chart_df["日期"], y=chart_df[col], mode="lines", name=label, line=dict(width=1.5)),
+                            row=1, col=1,
                         )
-                    else:
+                for col, label in [("BB_upper", "布林上轨"), ("BB_lower", "布林下轨")]:
+                    if col in chart_df.columns:
                         fig.add_trace(
-                            go.Scatter(
-                                x=chart_df["日期"],
-                                y=chart_df["收盘"],
-                                mode="lines",
-                                name="收盘",
-                                line=dict(color="blue", width=2),
-                            ),
-                            row=1,
-                            col=1,
+                            go.Scatter(x=chart_df["日期"], y=chart_df[col], mode="lines", name=label, line=dict(width=1, dash="dot")),
+                            row=1, col=1,
                         )
-                    if "MA_short" in chart_df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=chart_df["日期"],
-                                y=chart_df["MA_short"],
-                                mode="lines",
-                                name=f"MA{ma_short}",
-                                line=dict(color="orange", width=1.5),
-                            ),
-                            row=1,
-                            col=1,
-                        )
-                    if "MA_long" in chart_df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=chart_df["日期"],
-                                y=chart_df["MA_long"],
-                                mode="lines",
-                                name=f"MA{ma_long}",
-                                line=dict(color="green", width=1.5),
-                            ),
-                            row=1,
-                            col=1,
-                        )
-                    if "BB_upper" in chart_df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=chart_df["日期"],
-                                y=chart_df["BB_upper"],
-                                mode="lines",
-                                name="布林上轨",
-                                line=dict(color="gray", width=1, dash="dot"),
-                            ),
-                            row=1,
-                            col=1,
-                        )
-                    if "BB_lower" in chart_df.columns:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=chart_df["日期"],
-                                y=chart_df["BB_lower"],
-                                mode="lines",
-                                name="布林下轨",
-                                line=dict(color="gray", width=1, dash="dot"),
-                            ),
-                            row=1,
-                            col=1,
-                        )
-                    if "成交量" in chart_df.columns and chart_df["成交量"].notna().any():
-                        fig.add_trace(
-                            go.Bar(
-                                x=chart_df["日期"],
-                                y=chart_df["成交量"],
-                                name="成交量",
-                                marker_color="lightblue",
-                                showlegend=False,
-                            ),
-                            row=2,
-                            col=1,
-                        )
-                    fig.update_layout(
-                        xaxis_rangeslider_visible=False,
-                        height=560,
-                        template="plotly_white",
+                if "成交量" in chart_df.columns and chart_df["成交量"].notna().any():
+                    fig.add_trace(
+                        go.Bar(x=chart_df["日期"], y=chart_df["成交量"], name="成交量", marker_color="lightblue", showlegend=False),
+                        row=2, col=1,
                     )
-                    fig.update_xaxes(title_text="日期", row=2, col=1)
-                    st.plotly_chart(fig, use_container_width=True)
-
+                fig.update_layout(xaxis_rangeslider_visible=False, height=560, template="plotly_white")
+                fig.update_xaxes(title_text="日期", row=2, col=1)
+                st.plotly_chart(fig, use_container_width=True)
     _deep_fragment()
 
-with tab_backtest:
-    @st.fragment
-    def _backtest_fragment():
-        st.caption("步进式网格做T：趋势型 80% 底仓+回撤2%补5%、回升3%波段收割；震荡型 40% 底仓双向网格。标的顺序与「个股深度分析」一致。")
-        # 与个股深度分析同一选择逻辑：按 df_display 源数据顺序
-        grid_options = [f"{row['名称']} ({row['代码']})" for _, row in df_display.iterrows()]
-        grid_display_to_code = {f"{row['名称']} ({row['代码']})": str(row["代码"]) for _, row in df_display.iterrows()}
-        grid_code_to_personality = dict(zip(df_display["代码"].astype(str), df_display["资产性格"]))
-        grid_symbol_display = st.selectbox(
-            "网格标的",
-            options=grid_options if grid_options else ["请先加载 ETF 列表"],
-            index=0,
-            key="grid_symbol_select",
+with tab_accuracy:
+    st.subheader("过去 30 天信号准确率")
+    st.markdown("""
+    若按当日「明日建议」操作（分批吸纳视为买入、套利离场视为卖出），统计 **3 日后收益** 是否与建议一致：
+    - 建议**分批吸纳**且 3 日后**上涨** → 计为正确
+    - 建议**套利离场**且 3 日后**下跌** → 计为正确  
+    仅统计有明确买卖建议的交易日，「持有观望」不参与。准确率 = 正确次数 / 总次数。
+    """)
+    acc_cols = ["代码", "名称", "明日建议", "建议操作频率", "信号准确率30d"]
+    acc_cols = [c for c in acc_cols if c in df_display.columns]
+    if acc_cols:
+        st.dataframe(
+            df_display[acc_cols],
+            use_container_width=True,
+            column_config={"信号准确率30d": st.column_config.NumberColumn(format="%.1f%%")},
+            hide_index=True,
         )
-        grid_symbol = grid_display_to_code.get(grid_symbol_display) if grid_symbol_display in grid_display_to_code else None
-        if st.button("运行网格回测", key="grid_run"):
-            if not grid_symbol:
-                st.warning("请选择网格标的。")
-            else:
-                grid_name = next((row["名称"] for _, row in df_display.iterrows() if str(row["代码"]) == grid_symbol), grid_symbol)
-                asset_personality = grid_code_to_personality.get(grid_symbol)
-                with st.spinner(f"拉取 {grid_name}({grid_symbol}) 日线…"):
-                    series_grid = fetch_etf_hist_for_backtest(grid_symbol, years=BACKTEST_YEARS)
-                if series_grid is None or len(series_grid) < 50:
-                    st.warning(f"标的 {grid_name}({grid_symbol}) 日线数据不足。")
-                else:
-                    daily_grid, metrics_grid, grid_trades = run_grid_backtest(
-                        series_grid, debug=True, asset_personality=asset_personality
-                    )
-                    if daily_grid.empty:
-                        st.warning("回测未产生有效结果。")
-                    else:
-                        # 策略净值、基准(归一化100)、持仓成本线(右轴)、买卖/补仓/波段收割标记；跑输时标注原因
-                        close_series = series_grid.set_index("日期").reindex(daily_grid["日期"]).ffill().bfill()["收盘"]
-                        base_norm = (close_series / close_series.iloc[0] * 100).values if close_series.iloc[0] and close_series.iloc[0] > 0 else None
-                        nav_norm = (daily_grid["网格净值"].values / 500_000 * 100)
-                        cost_series = daily_grid["当前成本价"]
-                        fig_bt = go.Figure()
-                        fig_bt.add_trace(
-                            go.Scatter(
-                                x=daily_grid["日期"],
-                                y=nav_norm,
-                                mode="lines",
-                                name="策略净值(×100/50万)",
-                                line=dict(color="rgb(76, 175, 80)", width=2),
-                            )
-                        )
-                        if base_norm is not None:
-                            fig_bt.add_trace(
-                                go.Scatter(
-                                    x=daily_grid["日期"],
-                                    y=base_norm,
-                                    mode="lines",
-                                    name="标的收盘价(基准, 归一化100)",
-                                    line=dict(color="rgb(158, 158, 158)", width=1.5, dash="dash"),
-                                )
-                            )
-                        # 持仓成本线：右 Y 轴（元），观察随网格运行平均成本是否下移
-                        if cost_series.notna().any():
-                            fig_bt.add_trace(
-                                go.Scatter(
-                                    x=daily_grid["日期"],
-                                    y=cost_series,
-                                    mode="lines",
-                                    name="持仓成本线(元)",
-                                    line=dict(color="rgb(255, 152, 0)", width=1.5),
-                                    yaxis="y2",
-                                )
-                            )
-                        buy_trades = [t for t in grid_trades if t.get("方向") in ("买入", "补仓")]
-                        sell_trades = [t for t in grid_trades if t.get("方向") in ("卖出", "波段收割", "卖出(破趋势)")]
-                        nav_by_date = daily_grid.set_index("日期")["网格净值"]
-                        if buy_trades:
-                            valid_b = [(t["日期"], nav_by_date.loc[t["日期"]] / 500_000 * 100) for t in buy_trades if t["日期"] in nav_by_date.index]
-                            if valid_b:
-                                fig_bt.add_trace(go.Scatter(x=[p[0] for p in valid_b], y=[p[1] for p in valid_b], mode="markers", name="买入/补仓", marker=dict(symbol="triangle-up", size=8, color="green")))
-                        if sell_trades:
-                            valid_s = [(t["日期"], nav_by_date.loc[t["日期"]] / 500_000 * 100) for t in sell_trades if t["日期"] in nav_by_date.index]
-                            if valid_s:
-                                fig_bt.add_trace(go.Scatter(x=[p[0] for p in valid_s], y=[p[1] for p in valid_s], mode="markers", name="卖出/波段收割", marker=dict(symbol="triangle-down", size=8, color="red")))
-                        layout_kw = {
-                            "title": f"网格回测：{grid_name} {grid_symbol}",
-                            "xaxis_title": "日期",
-                            "yaxis_title": "净值/基准(归一化)",
-                            "height": 420,
-                            "template": "plotly_white",
-                            "legend": dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        }
-                        if cost_series.notna().any():
-                            layout_kw["yaxis2"] = dict(title="持仓成本线(元)", overlaying="y", side="right", showgrid=False)
-                        underperform = metrics_grid.get("跑输原因")
-                        if underperform:
-                            layout_kw["annotations"] = [
-                                dict(text=f"跑输基准原因：{underperform}", xref="paper", yref="paper", x=0.5, y=0.95, showarrow=False, font=dict(size=14, color="crimson"))
-                            ]
-                        fig_bt.update_layout(**layout_kw)
-                        st.plotly_chart(fig_bt, use_container_width=True)
-
-                        # 资产性格与策略说明
-                        personality = metrics_grid.get("资产性格")
-                        strategy_desc = metrics_grid.get("策略说明")
-                        if personality or strategy_desc:
-                            st.subheader("资产性格与策略")
-                            st.markdown(f"**{personality or '—'}** · {strategy_desc or ''}")
-
-                        # 清爽表格：代码、名称、现价、今日波动率、累计网格利润（一行）
-                        vol_20 = None
-                        if "收盘" in series_grid.columns and len(series_grid) >= 20:
-                            ret = series_grid["收盘"].pct_change().dropna().tail(20)
-                            vol_20 = float(ret.std() * 100) if len(ret) > 0 else None
-                        summary = pd.DataFrame([{
-                            "代码": grid_symbol,
-                            "名称": grid_name,
-                            "现价": metrics_grid.get("现价"),
-                            "今日波动率%": round(vol_20, 2) if vol_20 is not None else None,
-                            "累计网格利润": round(metrics_grid.get("累计网格利润", 0), 2),
-                        }])
-                        st.subheader("回测结果一览")
-                        st.dataframe(summary, use_container_width=True, hide_index=True,
-                                     column_config={"现价": st.column_config.NumberColumn(format="%.4f")})
-
-                        # 手续费/利润比、网格活跃度
-                        total_fee = metrics_grid.get("总手续费") or 0
-                        fee_pct = metrics_grid.get("手续费占利润比pct") or 0
-                        fee_ratio = metrics_grid.get("手续费利润比")
-                        active = metrics_grid.get("网格活跃度_每周成交次数")
-                        c1, c2, c3 = st.columns(3)
-                        with c1:
-                            st.metric("总手续费", f"¥{total_fee:,.2f}", None)
-                        with c2:
-                            st.metric("手续费/利润比", f"{fee_pct:.1f}%" if fee_pct is not None else "—", "占利润比例")
-                        with c3:
-                            st.metric("网格活跃度", f"{active:.2f} 次/周" if active is not None else "—", "平均每周成交次数")
-
-                        # 自动建议
-                        suggestion = metrics_grid.get("自动建议")
-                        if suggestion:
-                            st.info("💡 " + suggestion)
-
-                        # 操作日志：最近 10 次网格成交
-                        st.subheader("最近 10 次网格成交")
-                        last_10 = grid_trades[-10:] if len(grid_trades) >= 10 else grid_trades
-                        if last_10:
-                            log_df = pd.DataFrame([
-                                {"时间": t["日期"].strftime("%Y-%m-%d"), "方向": t["方向"], "价格": t["成交价"], "手续费": t["手续费"]}
-                                for t in last_10
-                            ])
-                            st.dataframe(log_df, use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("无网格成交记录（仅初始底仓）。")
-
-                        # 趋势型 vs 震荡型 网格贡献对比（自动验证「震荡型是否更适合做T」）
-                        st.subheader("趋势型 vs 震荡型 网格贡献对比")
-                        if st.button("运行对比（当前列表前 20 只）", key="grid_compare_run"):
-                            limit = min(20, len(df_display))
-                            results_by_personality = []
-                            with st.spinner(f"正在对前 {limit} 只标的逐只回测并分组…"):
-                                for idx in range(limit):
-                                    row = df_display.iloc[idx]
-                                    code = str(row["代码"])
-                                    name = row["名称"]
-                                    pers = row.get("资产性格")
-                                    if pers not in (ASSET_TREND, ASSET_OSCILLATING):
-                                        continue
-                                    series_bt = fetch_etf_hist_for_backtest(code, years=BACKTEST_YEARS)
-                                    if series_bt is None or len(series_bt) < 50:
-                                        continue
-                                    _, m, _ = run_grid_backtest(series_bt, debug=False, asset_personality=pers)
-                                    if m:
-                                        results_by_personality.append({
-                                            "资产性格": pers,
-                                            "累计网格利润": m.get("累计网格利润", 0),
-                                            "做T额外收益pct": m.get("做T额外收益pct", 0),
-                                        })
-                            if results_by_personality:
-                                comp_df = pd.DataFrame(results_by_personality)
-                                summary_comp = comp_df.groupby("资产性格").agg(
-                                    标的数=("资产性格", "count"),
-                                    平均累计网格利润=("累计网格利润", "mean"),
-                                    平均做T额外收益pct=("做T额外收益pct", "mean"),
-                                ).reset_index()
-                                st.dataframe(summary_comp, use_container_width=True, hide_index=True)
-                                st.caption("验证：若震荡型平均做T额外收益高于趋势型，则说明震荡型资产更适合网格做T。")
-                            else:
-                                st.caption("无有效回测结果（需标的含趋势型/震荡型分类）。")
-    _backtest_fragment()
 
 st.divider()
-st.caption(f"ETF 列表配置：{ETF_LIST_PATH}")
+st.caption(f"ETF 列表：{ETF_LIST_PATH}")
 
-with st.expander("📖 步进式网格做T 说明", expanded=False):
+with st.expander("📖 每日操作建议算法说明", expanded=False):
     st.markdown("""
-**步进式网格 (Stepping Grid)**
+**操作逻辑（Action Logic）**
 
-- **资金**：初始 50 万元，50% 底仓、50% 现金做 T，每格 5%。
-- **ATR 自适应步长**：每日 `grid_step = ATR(14) / 当前价格`，步长随波动变化，限制在 0.5%～5%。
-- **成交判定**：使用 **High/Low**：当日 **Low** 触及买入档则买，**High** 触及卖出档则卖；现金用完停止买、仓位卖完停止卖。
-- **盈利门槛**：预期利润 `单笔额×grid_step` 须 ≥ 15 元（3 倍最低手续费）才触发，否则放弃该笔，减少无效损耗。
-- **成本**：`max(成交额×0.0012, 5)`。页面展示 **手续费/利润比**、**网格活跃度**（平均每周成交次数）及 **自动建议**（效果不佳时提示波动率或单笔投入）。
-- **信号**：默认网格标的（513110）按「现价 vs 近 30 日均价」±1.2% 给出 买入/卖出/持有。
+- **[买入补仓] 分批吸纳**  
+  当价格回落至 **MA60 附近**（上下约 2%）且 **RSI < 45** 时，标记为「分批吸纳」，适合逢低加仓。
+
+- **[持有观望]**  
+  当价格在均线之上平稳运行，且没有触及 MA60 吸纳区或布林上轨时，标记为「持有观望」。
+
+- **[套利卖出] 套利离场**  
+  当价格**触及布林带上轨**时，标记为「套利离场」，可考虑兑现部分利润。（若网格利润覆盖 5 倍手续费时更佳，本仪表盘以触及上轨为主要条件。）
+
+**行情透视与偏离度**
+
+- **距一年高% / 距一年低%**：当前价相对过去约 250 个交易日最高价、最低价的位置，用于判断价格所处空间。
+- **Bias_MA20 / MA60 / MA200**：价格相对三条均线的乖离率（百分比），偏离过大时需警惕回调或反弹。
+- **溢价率**：QDII ETF 估算溢价率（若数据源支持则显示），便于避免高溢价接盘。
+- **极端风险模拟**：侧栏可输入当前账户/持仓市值，查看若发生 15% 回撤后的金额，仅供压力测试参考。
     """)
