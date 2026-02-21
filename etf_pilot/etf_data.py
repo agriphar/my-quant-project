@@ -134,6 +134,7 @@ RSI_ADDON_MAX = 45        # RSI < 45 视为可分批吸纳
 BB_UPPER_TOUCH = 0.998    # 收盘 >= 布林上轨*此系数视为触及上轨
 SIGNAL_FWD_DAYS = 5       # 信号准确率：看 N 日后涨跌
 SIGNAL_LOOKBACK_DAYS = 30 # 过去 30 天统计准确率
+ACCURACY_LOOKBACK_DAYS = 60  # 准确率统计用的回溯天数（大于 30 以增加有效信号数，避免样本不足）
 # 溢价基准与动态信号
 PREMIUM_AVG_DAYS = 22           # 过去 22 个交易日（约一个月）平均溢价率
 PREMIUM_PCTILE_DAYS = 60       # 分位统计窗口 60 天
@@ -142,7 +143,7 @@ PREMIUM_SAFE_PLUS_PCT = 1.0    # 当前溢价 < 平均溢价 + 1% 视为安全�
 PREMIUM_EXTREME_MULT = 1.5     # 当前溢价 > 平均溢价 * 1.5
 PREMIUM_PCTILE_HIGH = 90       # 分位 > 90% 且满足倍数时强制减仓/观望
 PREMIUM_PCTILE_MIN_DAYS = 10   # 至少 10 天即计算分位（软化窗口），否则仅显示当前溢价率
-MIN_ACCURACY_SAMPLE = 3        # 准确率至少 N 次买/卖建议才显示百分比
+MIN_ACCURACY_SAMPLE = 1        # 准确率至少 N 次买/卖建议才显示百分比（1 即显示，避免「样本不足」无意义）
 
 
 def _linear_regression_r2_slope(close: pd.Series, window: int = REGRESSION_WINDOW) -> tuple:
@@ -277,14 +278,16 @@ def compute_signal_accuracy_30d(
     nav_hist: pd.DataFrame | None = None,
 ) -> dict:
     """
-    过去 30 天信号准确率（仅统计补仓/减仓，且信号须已跑满 5 日）：
-    - 对比「信号发出日收盘价」与「信号发出后第 5 个交易日收盘价」。
-    - 若信号发出距今不足 5 天，则该信号不计入。
-    - 仅当建议次数 >= MIN_ACCURACY_SAMPLE 时显示百分比；否则返回状态文案。
+    近期信号准确率（仅统计补仓/减仓，且信号须已跑满 5 日）：
+    - 回溯窗口为 ACCURACY_LOOKBACK_DAYS（60 日），以在保证 r2/slope 回归所需 180 日前提下尽量多取有效信号，避免样本不足。
+    - 回溯时使用与「明日建议」完全一致的规则：按日计算 r2/slope（180 日回归）及 bias_ma20/bias_ma200，再调用 compute_daily_action。
+    - 对比「信号发出日收盘价」与「信号发出后第 5 个交易日收盘价」判定对错。
+    - 有至少 1 次有效建议即显示百分比（正确/总数）；0 次为「近期无动作」。
     返回 {"信号准确率30d": float|None, "实战建议次数": int, "信号准确率显示": str}。
     """
     out = {"信号准确率30d": None, "实战建议次数": 0, "信号准确率显示": "—"}
-    if hist is None or len(hist) < SIGNAL_LOOKBACK_DAYS + SIGNAL_FWD_DAYS + 5:
+    min_bars = REGRESSION_WINDOW + SIGNAL_FWD_DAYS
+    if hist is None or len(hist) < min_bars:
         return out
     need = ["收盘", "MA60", "RSI", "BB_upper"]
     if not all(c in hist.columns for c in need):
@@ -294,9 +297,9 @@ def compute_signal_accuracy_30d(
         return out
     merged = merged.sort_values("日期").reset_index(drop=True)
     close = merged["收盘"].astype(float)
-    start_i = max(0, len(merged) - SIGNAL_LOOKBACK_DAYS)
     end_i = len(merged) - SIGNAL_FWD_DAYS
-    if start_i >= end_i:
+    start_i = max(REGRESSION_WINDOW - 1, len(merged) - ACCURACY_LOOKBACK_DAYS)
+    if start_i < 0 or start_i >= end_i:
         return out
     correct = 0
     total = 0
@@ -309,6 +312,13 @@ def compute_signal_accuracy_30d(
         if p0 is None or p0 <= 0 or pd.isna(p0) or pd.isna(p5):
             continue
         ret5 = (float(p5) - float(p0)) / float(p0)
+        hist_slice = merged.iloc[: i + 1]
+        if len(hist_slice) >= REGRESSION_WINDOW:
+            r2_i, slope_i = _linear_regression_r2_slope(hist_slice["收盘"], REGRESSION_WINDOW)
+        else:
+            r2_i, slope_i = None, None
+        bias_ma20_i = _bias_pct(row_i.get("收盘"), row_i.get("MA20"))
+        bias_ma200_i = _bias_pct(row_i.get("收盘"), row_i.get("MA200"))
         premium_i = row_i.get("溢价率")
         if pd.isna(premium_i) or premium_i is None:
             avg_22_i = None
@@ -331,6 +341,10 @@ def compute_signal_accuracy_30d(
             avg_premium_22d=avg_22_i,
             premium_std_22d=std_22_i,
             premium_pctile_60=pct_60_i,
+            r2=r2_i,
+            slope=slope_i,
+            bias_ma20=bias_ma20_i,
+            bias_ma200=bias_ma200_i,
         )[0]
         if action in ("持有观望", "极度过热，禁买"):
             continue
@@ -349,11 +363,11 @@ def compute_signal_accuracy_30d(
         out["信号准确率显示"] = "近期无动作"
         return out
     if total < MIN_ACCURACY_SAMPLE:
-        out["信号准确率显示"] = "样本不足"
+        out["信号准确率显示"] = f"样本不足({total})"
         return out
     pct = round(correct / total * 100, 1)
     out["信号准确率30d"] = pct
-    out["信号准确率显示"] = f"{pct}%"
+    out["信号准确率显示"] = f"{correct}/{total} ({pct}%)"
     return out
 
 
