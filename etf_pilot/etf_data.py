@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """ETF 数据获取与指标计算（RSI、布林带、多因子信号、建议仓位）。"""
+import logging
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -14,6 +15,13 @@ from strategy.scoring import premium_deviation, calculate_score, get_signal_from
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 ETF_LIST_PATH = DATA_DIR / "ETF汇总.xlsx"
+logger = logging.getLogger(__name__)
+
+# 场内基金当日净值页缓存，用于历史净值接口返回全 NaN 时的兜底（仅能拿到最近 1～2 个交易日）
+_daily_em_cache: pd.DataFrame | None = None
+_daily_em_cache_ts: float = 0
+DAILY_EM_CACHE_TTL = 300
+_nav_warned_codes: set[str] = set()
 
 DEFAULT_ETF_LIST = [
     {"代码": "513100", "名称": "纳指ETF"},
@@ -356,9 +364,59 @@ def drawdown_15pct_value(current_value: float) -> float:
     return round(float(current_value) * (1 - 0.15), 2)
 
 
+def _get_nav_fallback_daily_em(symbol: str) -> pd.DataFrame | None:
+    """当 fund_etf_fund_info_em 返回的净值列全为 NaN 时，用场内基金当日净值页兜底，返回 1～2 天的 日期+单位净值。"""
+    global _daily_em_cache, _daily_em_cache_ts
+    now = time.time()
+    if _daily_em_cache is None or (now - _daily_em_cache_ts) > DAILY_EM_CACHE_TTL:
+        try:
+            _daily_em_cache = ak.fund_etf_fund_daily_em()
+            _daily_em_cache_ts = now
+        except Exception as e:
+            logger.debug("fund_etf_fund_daily_em 失败: %s", e)
+            return None
+    if _daily_em_cache is None or _daily_em_cache.empty:
+        return None
+    df = _daily_em_cache.rename(columns=lambda c: str(c).strip())
+    code_col = "基金代码"
+    if code_col not in df.columns:
+        return None
+    row = df[df[code_col].astype(str).str.strip() == symbol.strip()]
+    if row.empty:
+        return None
+    row = row.iloc[0]
+    rows = []
+    for col in df.columns:
+        if "单位净值" not in col or "累计" in col:
+            continue
+        val = row.get(col)
+        if pd.isna(val):
+            continue
+        try:
+            v = float(val)
+            if v <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        date_part = col.replace("-单位净值", "").strip()
+        if not date_part:
+            continue
+        try:
+            dt = pd.to_datetime(date_part, errors="coerce")
+            if pd.isna(dt):
+                continue
+            rows.append({"日期": dt.normalize(), "单位净值": v})
+        except Exception:
+            continue
+    if not rows:
+        return None
+    out = pd.DataFrame(rows).drop_duplicates(subset=["日期"]).sort_values("日期").reset_index(drop=True)
+    return out[["日期", "单位净值"]]
+
+
 def get_etf_nav_hist(symbol: str, days: int = 70) -> pd.DataFrame | None:
     """获取单只 ETF 历史单位净值，用于计算历史溢价率。返回 日期、单位净值。
-    若接口无「单位净值」则尝试「基金净值」「net_value」；均无或全为空则返回 None。
+    若接口无「单位净值」则尝试「基金净值」「net_value」等；均无或全为空则返回 None。
     API 失败或返回空时最多重试 3 次，每次间隔 0.5 秒。
     """
     end_date = datetime.now()
@@ -366,6 +424,7 @@ def get_etf_nav_hist(symbol: str, days: int = 70) -> pd.DataFrame | None:
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
     raw = None
+    last_exc = None
     for attempt in range(3):
         try:
             raw = ak.fund_etf_fund_info_em(
@@ -373,22 +432,54 @@ def get_etf_nav_hist(symbol: str, days: int = 70) -> pd.DataFrame | None:
                 start_date=start_str,
                 end_date=end_str,
             )
-        except Exception:
+        except Exception as e:
             raw = None
+            last_exc = e
+            logger.debug("get_etf_nav_hist %s attempt %s failed: %s", symbol, attempt + 1, e)
         if raw is not None and not raw.empty:
             break
         if attempt < 2:
             time.sleep(0.5)
     if raw is None or raw.empty:
+        logger.info(
+            "get_etf_nav_hist %s: 接口无数据 (raw=%s)%s",
+            symbol,
+            "empty" if raw is not None else "None",
+            f", last_error={last_exc!r}" if last_exc else "",
+        )
         return None
     raw = raw.rename(columns=lambda c: str(c).strip())
-    date_col = next((c for c in ["净值日期", "日期", "date"] if c in raw.columns), None)
+    date_candidates = ["净值日期", "日期", "date", "披露日期"]
+    date_col = next((c for c in date_candidates if c in raw.columns), None)
+    nav_candidates = ["单位净值", "基金净值", "net_value", "nav", "累计净值"]
     nav_col = None
-    for c in ["单位净值", "基金净值", "net_value"]:
-        if c in raw.columns and raw[c].notna().any() and (raw[c].astype(str).str.strip() != "").any():
+    for c in nav_candidates:
+        if c not in raw.columns:
+            continue
+        s = pd.to_numeric(raw[c], errors="coerce")
+        if s.notna().any() and (s > 0).any():
             nav_col = c
             break
     if not date_col or not nav_col:
+        fallback = _get_nav_fallback_daily_em(symbol)
+        if fallback is not None and not fallback.empty:
+            logger.debug("get_etf_nav_hist %s: 使用场内当日净值页兜底 (%d 条)", symbol, len(fallback))
+            return fallback
+        global _nav_warned_codes
+        if symbol not in _nav_warned_codes:
+            _nav_warned_codes.add(symbol)
+            sample = {}
+            for c in ["单位净值", "累计净值"]:
+                if c in raw.columns:
+                    sample[c] = raw[c].head(5).tolist()
+            logger.warning(
+                "get_etf_nav_hist %s: 缺少日期或净值列 (date_col=%s, nav_col=%s), columns=%s, sample=%s",
+                symbol,
+                date_col,
+                nav_col,
+                raw.columns.tolist(),
+                sample,
+            )
         return None
     df = raw[[date_col, nav_col]].copy()
     df["日期"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
@@ -396,6 +487,7 @@ def get_etf_nav_hist(symbol: str, days: int = 70) -> pd.DataFrame | None:
     df[nav_col] = pd.to_numeric(df[nav_col], errors="coerce")
     df = df[df[nav_col].notna() & (df[nav_col] > 0)].sort_values("日期").tail(days).reset_index(drop=True)
     if df.empty:
+        logger.debug("get_etf_nav_hist %s: 清洗后无有效行", symbol)
         return None
     return df[["日期", nav_col]].rename(columns={nav_col: "单位净值"})
 
@@ -526,6 +618,10 @@ def get_etf_spot_premium_map(etf_codes: list[str]) -> dict[str, float]:
                     if last_close is not None and not pd.isna(last_close):
                         premium = (float(last_close) - float(last_nav)) / float(last_nav) * 100
                         out[code] = round(premium, 2)
+                        logger.debug(
+                            "get_etf_spot_premium_map %s: 使用日线+最近净值估算溢价 (无 IOPV)",
+                            code,
+                        )
         except Exception:
             continue
     return out
@@ -648,11 +744,18 @@ def build_monitor_table_advanced(
             continue
         try:
             nav_hist = get_etf_nav_hist(code, PREMIUM_FETCH_DAYS)
+            reason_no_nav = None
             if nav_hist is None or nav_hist.empty:
                 avg_premium_22d, premium_pctile_60d, premium_std_22d = None, None, None
                 premium_valid_count, no_premium_data, sample_very_small = 0, True, False
-                premium_display = "无净值数据"
-                action_no_nav = "缺少 IOPV/净值数据，无法评估溢价"
+                if premium_pct is not None and not pd.isna(premium_pct):
+                    premium_display = format_premium_with_bar(premium_pct, None) + " (仅实时)"
+                    action_no_nav = "无历史净值，仅参考实时溢价"
+                    reason_no_nav = "仅实时溢价，无历史分位"
+                else:
+                    premium_display = "无净值数据"
+                    action_no_nav = "缺少 IOPV/净值数据，无法评估溢价"
+                    reason_no_nav = "接口未返回 IOPV/净值列或数据全为空"
             else:
                 avg_premium_22d, premium_pctile_60d, premium_std_22d, premium_valid_count, no_premium_data, sample_very_small = get_etf_premium_stats(
                     hist, nav_hist, premium_pct, code=code
@@ -674,7 +777,7 @@ def build_monitor_table_advanced(
             bias_60 = _bias_pct(float(close) if close is not None else None, last.get("MA60"))
             bias_200 = _bias_pct(float(close) if close is not None else None, last.get("MA200"))
             if action_no_nav is not None:
-                action, reason = action_no_nav, "接口未返回 IOPV/净值列或数据全为空"
+                action, reason = action_no_nav, (reason_no_nav or "接口未返回 IOPV/净值列或数据全为空")
             else:
                 action, reason = compute_daily_action(
                     last,

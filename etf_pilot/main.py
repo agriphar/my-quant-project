@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 """跨境 ETF 决策辅助仪表盘：每日操作指导，不负责自动交易。"""
+import logging
+import sys
+import warnings
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -23,9 +27,22 @@ from etf_data import (
     drawdown_15pct_value,
 )
 
+# 控制台输出 etf_data 日志，便于排查「缺少 IOPV/净值数据」等：接口无数据、列名不匹配、fallback 等
+_log_handler = logging.StreamHandler(sys.stderr)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger("etf_data").addHandler(_log_handler)
+logging.getLogger("etf_data").setLevel(logging.INFO)
+
+warnings.filterwarnings(
+    "ignore",
+    message="Could not infer format, so each element will be parsed individually",
+    category=UserWarning,
+    module="pandas",
+)
+
 st.set_page_config(page_title="跨境 ETF 决策辅助", page_icon="📊", layout="wide")
 st.title("📊 跨境 ETF 决策辅助仪表盘")
-st.caption("仅提供每日操作指导，不构成自动交易。")
+st.caption("本项目仅供学习和研究使用，不构成任何投资建议。股市有风险，投资需谨慎。")
 
 ensure_data_dir()
 etf_list_full = load_etf_list()
@@ -175,7 +192,7 @@ with tab_dashboard:
         styled = styled.apply(_style_明日建议_high_premium, subset=["明日建议"], axis=1)
     st.dataframe(
         styled,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.4f"),
             "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
@@ -231,7 +248,7 @@ with tab_radar:
     radar_styled = radar_df.style.apply(_radar_rsi_style, subset=["RSI"], axis=0) if "RSI" in radar_df.columns else radar_df.style
     st.dataframe(
         radar_styled,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.4f"),
             "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
@@ -297,7 +314,7 @@ with tab_deep:
                     )
                 fig.update_layout(xaxis_rangeslider_visible=False, height=560, template="plotly_white")
                 fig.update_xaxes(title_text="日期", row=2, col=1)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
     _deep_fragment()
 
 with tab_accuracy:
@@ -313,7 +330,7 @@ with tab_accuracy:
         acc_df = df_display[acc_cols].copy().replace([np.inf, -np.inf], np.nan).fillna("-")
         st.dataframe(
             acc_df,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "信号准确率显示": st.column_config.TextColumn("准确率30d"),
             },
