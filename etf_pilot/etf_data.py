@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ETF 数据获取与指标计算（RSI、布林带、多因子信号、建议仓位）。"""
+"""ETF 数据获取与监控表编排（委托 market_regime、signal_engine、decision_engine）。"""
 import logging
 import time
 from pathlib import Path
@@ -10,8 +10,15 @@ import numpy as np
 import akshare as ak
 
 from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD
-from strategy import compute_deviation, check_chase_high
-from strategy.scoring import premium_deviation, calculate_score, get_signal_from_score
+from market_regime.trend import compute_trend_classification, REGRESSION_WINDOW
+from signal_engine.indicators import rsi, bollinger, atr, pct_from_1y_high_low, bias_pct
+from decision_engine.daily_action import (
+    compute_daily_action,
+    compute_action_frequency,
+    compute_signal_accuracy_30d,
+)
+from decision_engine.daily_action import SIGNAL_LOOKBACK_DAYS
+from risk_engine import drawdown_15pct_value  # 向后兼容：原 etf_data 对外提供
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 ETF_LIST_PATH = DATA_DIR / "ETF汇总.xlsx"
@@ -71,7 +78,7 @@ def load_etf_list() -> pd.DataFrame:
         df["类型"] = df.apply(lambda r: get_asset_type(r.get("名称", ""), r.get(type_col)), axis=1)
     else:
         try:
-            from strategy.classification import get_cached_classification
+            from market_regime.classification import get_cached_classification
             df = get_cached_classification(df)
         except Exception:
             df["类型"] = df["名称"].map(lambda n: get_asset_type(n, None))
@@ -98,284 +105,10 @@ def _normalize_hist(raw: pd.DataFrame) -> pd.DataFrame | None:
     return df[["日期", "收盘", "成交量"]].copy()
 
 
-def _rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def _bollinger(close: pd.Series, period: int = BB_PERIOD, num_std: float = BB_STD):
-    mid = close.rolling(period, min_periods=1).mean()
-    std = close.rolling(period, min_periods=1).std()
-    return mid, mid + num_std * std, mid - num_std * std
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """ATR = SMA(TR, period), TR = max(H-L, |H-prev_C|, |L-prev_C|)。"""
-    prev_close = close.shift(1)
-    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-    return tr.rolling(period, min_periods=1).mean()
-
-
-# 趋势/震荡分类：180 日线性回归，R²>0.4 且斜率>0 为 Trend
-REGRESSION_WINDOW = 180
-R2_TREND_THRESHOLD = 0.4
-ASSET_TREND = "Trend (趋势型)"
-ASSET_OSCILLATING = "Oscillating (震荡型)"
-
-# 每日操作建议算法
-TRADING_DAYS_1Y = 250
-MA60_NEAR_PCT = 0.02      # 价格在 MA60 上下 2% 内视为「MA60 附近」
-RSI_ADDON_MAX = 45        # RSI < 45 视为可分批吸纳
-BB_UPPER_TOUCH = 0.998    # 收盘 >= 布林上轨*此系数视为触及上轨
-SIGNAL_FWD_DAYS = 5       # 信号准确率：看 N 日后涨跌
-SIGNAL_LOOKBACK_DAYS = 30 # 过去 30 天统计准确率
-ACCURACY_LOOKBACK_DAYS = 60  # 准确率统计用的回溯天数（大于 30 以增加有效信号数，避免样本不足）
-# 溢价基准与动态信号
-PREMIUM_AVG_DAYS = 22           # 过去 22 个交易日（约一个月）平均溢价率
-PREMIUM_PCTILE_DAYS = 60       # 分位统计窗口 60 天
-PREMIUM_FETCH_DAYS = 100       # 抓取最近 100 个交易日数据，确保扣除节假日仍能填满 60 日窗口
-PREMIUM_SAFE_PLUS_PCT = 1.0    # 当前溢价 < 平均溢价 + 1% 视为安全，允许按技术面给建议
-PREMIUM_EXTREME_MULT = 1.5     # 当前溢价 > 平均溢价 * 1.5
-PREMIUM_PCTILE_HIGH = 90       # 分位 > 90% 且满足倍数时强制减仓/观望
-PREMIUM_PCTILE_MIN_DAYS = 10   # 至少 10 天即计算分位（软化窗口），否则仅显示当前溢价率
-MIN_ACCURACY_SAMPLE = 1        # 准确率至少 N 次买/卖建议才显示百分比（1 即显示，避免「样本不足」无意义）
-
-
-def _linear_regression_r2_slope(close: pd.Series, window: int = REGRESSION_WINDOW) -> tuple:
-    """过去 window 日收盘价的线性回归，返回 (R², 斜率)。斜率 = 每日价格变动（元/日）。"""
-    if close is None or len(close) < window:
-        return None, None
-    y = close.iloc[-window:].values.astype(float)
-    if np.any(np.isnan(y)) or np.var(y) == 0:
-        return None, None
-    x = np.arange(len(y), dtype=float)
-    n = len(x)
-    x_mean = x.mean()
-    y_mean = y.mean()
-    ss_xy = np.sum((x - x_mean) * (y - y_mean))
-    ss_xx = np.sum((x - x_mean) ** 2)
-    ss_yy = np.sum((y - y_mean) ** 2)
-    if ss_xx == 0 or ss_yy == 0:
-        return None, None
-    slope = ss_xy / ss_xx
-    r_squared = (ss_xy ** 2) / (ss_xx * ss_yy) if (ss_xx * ss_yy) > 0 else 0.0
-    return float(r_squared), float(slope)
-
-
-def compute_trend_classification(hist: pd.DataFrame) -> tuple:
-    """根据过去 180 日线性回归：R²>0.4 且斜率>0 为 Trend，否则 Oscillating。返回 (r2, slope, 资产性格)。"""
-    if hist is None or len(hist) < REGRESSION_WINDOW or "收盘" not in hist.columns:
-        return None, None, None
-    close = hist["收盘"]
-    r2, slope = _linear_regression_r2_slope(close, REGRESSION_WINDOW)
-    if r2 is not None and slope is not None:
-        personality = ASSET_TREND if (r2 > R2_TREND_THRESHOLD and slope > 0) else ASSET_OSCILLATING
-    else:
-        personality = None
-    return r2, slope, personality
-
-
-def _pct_from_1y_high_low(hist: pd.DataFrame) -> tuple:
-    """距一年内最高点、最低点的百分比。返回 (距最高点%, 距最低点%)。"""
-    if hist is None or len(hist) < 20 or "收盘" not in hist.columns:
-        return None, None
-    window = hist["收盘"].tail(TRADING_DAYS_1Y)
-    high_1y = window.max()
-    low_1y = window.min()
-    close = hist["收盘"].iloc[-1]
-    if pd.isna(close) or close <= 0:
-        return None, None
-    pct_from_high = (float(high_1y - close) / float(high_1y) * 100) if high_1y and high_1y > 0 else None
-    pct_from_low = (float(close - low_1y) / float(low_1y) * 100) if low_1y and low_1y > 0 else None
-    return pct_from_high, pct_from_low
-
-
-def _bias_pct(price: float | None, ma: float | None) -> float | None:
-    """乖离率：(price - ma) / ma * 100。"""
-    if price is None or ma is None or pd.isna(ma) or ma == 0:
-        return None
-    return round((float(price) - float(ma)) / float(ma) * 100, 2)
-
-
-def compute_daily_action(
-    last: pd.Series,
-    premium_pct: float | None = None,
-    avg_premium_22d: float | None = None,
-    premium_std_22d: float | None = None,
-    premium_pctile_60: float | None = None,
-    r2: float | None = None,
-    slope: float | None = None,
-    bias_ma20: float | None = None,
-    bias_ma200: float | None = None,
-) -> tuple:
-    """
-    每日操作建议（加权评分制 + 相对溢价）：
-    - 溢价偏离度 = (当前溢价 - 22日均值) / 22日标准差；>2.5 一票否决 -> 极度过热，禁买。
-    - 否则按 calculate_score（技术4 + 趋势3 + 溢价3）总分：>=7 强烈建议补仓，4~7 持有观望，<4 考虑套利/减仓。
-    """
-    if last.get("收盘") is None or pd.isna(last.get("收盘")):
-        return "持有观望", "数据不足"
-    dev = premium_deviation(premium_pct, avg_premium_22d, premium_std_22d)
-    score_result = calculate_score(
-        last,
-        r2=r2,
-        slope=slope,
-        premium_pctile_60=premium_pctile_60,
-        bias_ma20=bias_ma20,
-        bias_ma200=bias_ma200,
-    )
-    return get_signal_from_score(score_result, dev)
-
-
-def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAYS) -> int:
-    """过去 N 天内「强烈建议补仓」或「考虑套利/减仓」出现次数，用于排序（建议操作频率）。"""
-    if hist is None or len(hist) < 2 or "收盘" not in hist.columns:
-        return 0
-    need = ["收盘", "MA60", "RSI", "BB_upper"]
-    if not all(c in hist.columns for c in need):
-        return 0
-    tail = hist.tail(days)
-    count = 0
-    for _, row in tail.iterrows():
-        act, _ = compute_daily_action(row)
-        if act in ("强烈建议补仓", "考虑套利/减仓"):
-            count += 1
-    return count
-
-
-def _hist_daily_premium_merged(hist: pd.DataFrame, nav_hist: pd.DataFrame | None) -> pd.DataFrame | None:
-    """
-    将日线 hist 与净值 nav_hist 按日期合并，得到每日的场内价与溢价率（场内价=收盘）。
-    返回 DataFrame：日期、收盘、溢价率（及 hist 中已有的 MA60/RSI/BB_upper 等，若存在则保留）。
-    用于回溯时逐日使用「技术指标 + 溢价水位」重算建议。
-    """
-    if hist is None or hist.empty or "收盘" not in hist.columns:
-        return None
-    hist = hist.copy()
-    hist["日期"] = pd.to_datetime(hist["日期"]).dt.normalize()
-    if nav_hist is None or nav_hist.empty or "单位净值" not in nav_hist.columns:
-        return hist.assign(溢价率=np.nan)
-    nav = nav_hist.copy()
-    nav["日期"] = pd.to_datetime(nav["日期"]).dt.normalize()
-    merged = hist.merge(nav[["日期", "单位净值"]], on="日期", how="left")
-    merged["单位净值"] = merged["单位净值"].replace(0, np.nan)
-    merged["溢价率"] = np.nan
-    valid = merged["单位净值"].notna() & (merged["单位净值"] > 0)
-    merged.loc[valid, "溢价率"] = (
-        (merged.loc[valid, "收盘"].astype(float) - merged.loc[valid, "单位净值"].astype(float))
-        / merged.loc[valid, "单位净值"].astype(float) * 100
-    )
-    return merged
-
-
-def compute_signal_accuracy_30d(
-    hist: pd.DataFrame,
-    nav_hist: pd.DataFrame | None = None,
-) -> dict:
-    """
-    近期信号准确率（仅统计补仓/减仓，且信号须已跑满 5 日）：
-    - 回溯窗口为 ACCURACY_LOOKBACK_DAYS（60 日），以在保证 r2/slope 回归所需 180 日前提下尽量多取有效信号，避免样本不足。
-    - 回溯时使用与「明日建议」完全一致的规则：按日计算 r2/slope（180 日回归）及 bias_ma20/bias_ma200，再调用 compute_daily_action。
-    - 对比「信号发出日收盘价」与「信号发出后第 5 个交易日收盘价」判定对错。
-    - 有至少 1 次有效建议即显示百分比（正确/总数）；0 次为「近期无动作」。
-    返回 {"信号准确率30d": float|None, "实战建议次数": int, "信号准确率显示": str}。
-    """
-    out = {"信号准确率30d": None, "实战建议次数": 0, "信号准确率显示": "—"}
-    min_bars = REGRESSION_WINDOW + SIGNAL_FWD_DAYS
-    if hist is None or len(hist) < min_bars:
-        return out
-    need = ["收盘", "MA60", "RSI", "BB_upper"]
-    if not all(c in hist.columns for c in need):
-        return out
-    merged = _hist_daily_premium_merged(hist, nav_hist)
-    if merged is None:
-        return out
-    merged = merged.sort_values("日期").reset_index(drop=True)
-    close = merged["收盘"].astype(float)
-    end_i = len(merged) - SIGNAL_FWD_DAYS
-    start_i = max(REGRESSION_WINDOW - 1, len(merged) - ACCURACY_LOOKBACK_DAYS)
-    if start_i < 0 or start_i >= end_i:
-        return out
-    correct = 0
-    total = 0
-    for i in range(start_i, end_i):
-        if i + SIGNAL_FWD_DAYS >= len(merged):
-            break
-        row_i = merged.iloc[i]
-        p0 = close.iloc[i]
-        p5 = close.iloc[i + SIGNAL_FWD_DAYS]
-        if p0 is None or p0 <= 0 or pd.isna(p0) or pd.isna(p5):
-            continue
-        ret5 = (float(p5) - float(p0)) / float(p0)
-        hist_slice = merged.iloc[: i + 1]
-        if len(hist_slice) >= REGRESSION_WINDOW:
-            r2_i, slope_i = _linear_regression_r2_slope(hist_slice["收盘"], REGRESSION_WINDOW)
-        else:
-            r2_i, slope_i = None, None
-        bias_ma20_i = _bias_pct(row_i.get("收盘"), row_i.get("MA20"))
-        bias_ma200_i = _bias_pct(row_i.get("收盘"), row_i.get("MA200"))
-        premium_i = row_i.get("溢价率")
-        if pd.isna(premium_i) or premium_i is None:
-            avg_22_i = None
-            pct_60_i = None
-            std_22_i = None
-        else:
-            sub = merged.loc[merged["日期"] <= row_i["日期"], "溢价率"].dropna().tail(PREMIUM_PCTILE_DAYS)
-            if len(sub) < 5:
-                avg_22_i = None
-                pct_60_i = None
-                std_22_i = None
-            else:
-                tail22 = sub.tail(PREMIUM_AVG_DAYS)
-                avg_22_i = float(tail22.mean())
-                std_22_i = float(tail22.std()) if len(tail22) > 1 and tail22.std() and not pd.isna(tail22.std()) else None
-                pct_60_i = _percentileofscore(sub.values, float(premium_i))
-        action = compute_daily_action(
-            row_i,
-            premium_pct=float(premium_i) if premium_i is not None and not pd.isna(premium_i) else None,
-            avg_premium_22d=avg_22_i,
-            premium_std_22d=std_22_i,
-            premium_pctile_60=pct_60_i,
-            r2=r2_i,
-            slope=slope_i,
-            bias_ma20=bias_ma20_i,
-            bias_ma200=bias_ma200_i,
-        )[0]
-        if action in ("持有观望", "极度过热，禁买"):
-            continue
-        if action == "强烈建议补仓":
-            total += 1
-            if ret5 > 0:
-                correct += 1
-            continue
-        if action == "考虑套利/减仓":
-            total += 1
-            if ret5 < 0:
-                correct += 1
-            continue
-    out["实战建议次数"] = total
-    if total == 0:
-        out["信号准确率显示"] = "近期无动作"
-        return out
-    if total < MIN_ACCURACY_SAMPLE:
-        out["信号准确率显示"] = f"样本不足({total})"
-        return out
-    pct = round(correct / total * 100, 1)
-    out["信号准确率30d"] = pct
-    out["信号准确率显示"] = f"{correct}/{total} ({pct}%)"
-    return out
-
-
-def drawdown_15pct_value(current_value: float) -> float:
-    """极端风险模拟：若标的发生 15% 回撤，账户会变成多少。"""
-    if current_value is None or pd.isna(current_value) or current_value < 0:
-        return 0.0
-    return round(float(current_value) * (1 - 0.15), 2)
+# 溢价统计用常量（get_etf_premium_stats、build_monitor_table 使用）
+PREMIUM_AVG_DAYS = 22
+PREMIUM_PCTILE_DAYS = 60
+PREMIUM_FETCH_DAYS = 100
 
 
 def _get_nav_fallback_daily_em(symbol: str) -> pd.DataFrame | None:
@@ -504,17 +237,6 @@ def get_etf_nav_hist(symbol: str, days: int = 70) -> pd.DataFrame | None:
         logger.debug("get_etf_nav_hist %s: 清洗后无有效行", symbol)
         return None
     return df[["日期", nav_col]].rename(columns={nav_col: "单位净值"})
-
-
-def _percentileofscore(arr: np.ndarray, score: float) -> float:
-    """0~100，表示 score 在 arr 中的百分位（小于等于 score 的比例 * 100）。"""
-    if arr is None or len(arr) == 0:
-        return np.nan
-    arr = np.asarray(arr, dtype=float)
-    arr = arr[~np.isnan(arr)]
-    if len(arr) == 0:
-        return np.nan
-    return float(np.sum(arr <= score) / len(arr) * 100)
 
 
 def get_etf_premium_stats(
@@ -703,9 +425,12 @@ def fetch_etf_daily(
     df["MA20"] = close.rolling(20, min_periods=1).mean()
     df["MA60"] = close.rolling(60, min_periods=10).mean()
     df["MA200"] = close.rolling(200, min_periods=1).mean()
-    df["RSI"] = _rsi(close, RSI_PERIOD)
-    mid, upper, lower = _bollinger(close, BB_PERIOD, BB_STD)
+    df["RSI"] = rsi(close, RSI_PERIOD)
+    mid, upper, lower = bollinger(close, BB_PERIOD, BB_STD)
     df["BB_upper"], df["BB_lower"] = upper, lower
+    high = df["最高"] if "最高" in df.columns else close
+    low = df["最低"] if "最低" in df.columns else close
+    df["ATR"] = atr(high, low, close, 14)
     return df
 
 
@@ -786,13 +511,27 @@ def build_monitor_table_advanced(
             close = last["收盘"]
             prev_close = prev["收盘"]
             pct = (float((close - prev_close) / prev_close * 100)) if prev_close and prev_close != 0 else None
-            pct_high, pct_low = _pct_from_1y_high_low(hist)
-            bias_20 = _bias_pct(float(close) if close is not None else None, last.get("MA20"))
-            bias_60 = _bias_pct(float(close) if close is not None else None, last.get("MA60"))
-            bias_200 = _bias_pct(float(close) if close is not None else None, last.get("MA200"))
+            pct_high, pct_low = pct_from_1y_high_low(hist)
+            bias_20 = bias_pct(float(close) if close is not None else None, last.get("MA20"))
+            bias_60 = bias_pct(float(close) if close is not None else None, last.get("MA60"))
+            bias_200 = bias_pct(float(close) if close is not None else None, last.get("MA200"))
             if action_no_nav is not None:
                 action, reason = action_no_nav, (reason_no_nav or "接口未返回 IOPV/净值列或数据全为空")
             else:
+                atr_pct = None
+                if last.get("ATR") is not None and last.get("收盘") and float(last.get("收盘", 0) or 0) > 0:
+                    try:
+                        atr_pct = float(last["ATR"]) / float(last["收盘"]) * 100
+                    except (TypeError, ValueError):
+                        pass
+                pct_drawdown_from_high = None
+                if hist is not None and len(hist) >= 60 and "收盘" in hist.columns:
+                    high_60d = hist["收盘"].astype(float).tail(60).max()
+                    if high_60d and high_60d > 0 and close is not None:
+                        try:
+                            pct_drawdown_from_high = (float(high_60d) - float(close)) / float(high_60d) * 100
+                        except (TypeError, ValueError):
+                            pass
                 action, reason = compute_daily_action(
                     last,
                     premium_pct=premium_pct,
@@ -801,8 +540,8 @@ def build_monitor_table_advanced(
                     premium_pctile_60=premium_pctile_60d,
                     r2=r2,
                     slope=slope,
-                    bias_ma20=bias_20,
-                    bias_ma200=bias_200,
+                    atr_pct=atr_pct,
+                    pct_drawdown_from_high=pct_drawdown_from_high,
                 )
                 if no_premium_data and premium_valid_count == 0:
                     action = "溢价数据不足"
@@ -898,6 +637,6 @@ def get_etf_hist_for_chart(
     close = df["收盘"]
     df["MA_short"] = close.rolling(ma_short, min_periods=1).mean()
     df["MA_long"] = close.rolling(ma_long, min_periods=1).mean()
-    _, up, lo = _bollinger(close, BB_PERIOD, BB_STD)
+    _, up, lo = bollinger(close, BB_PERIOD, BB_STD)
     df["BB_upper"], df["BB_lower"] = up, lo
     return df

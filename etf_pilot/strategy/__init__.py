@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""资产分级策略：Core / Tactical 信号、偏离度、补仓建议；加权评分制决策。"""
+"""策略层兼容：re-export 自 market_regime、signal_engine、decision_engine。"""
 from .asset_type import get_asset_type, ASSET_TYPE_CORE, ASSET_TYPE_TACTICAL
-from .signals import (
+from signal_engine.signals import (
     compute_signal,
     compute_deviation,
     check_chase_high,
     compute_addon_suggestion,
     compute_grid_signal,
 )
-from .scoring import premium_deviation, calculate_score, get_signal_from_score
+from decision_engine.scoring import premium_deviation, calculate_score, get_signal_from_score
 
 __all__ = [
     "get_asset_type",
