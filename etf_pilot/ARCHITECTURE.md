@@ -39,7 +39,8 @@ etf_pilot/
 │
 ├── explanation_engine/               # 5. 说明与理由
 │   ├── __init__.py
-│   └── reasons.py                  # 建议理由文案（从决策层抽离）
+│   ├── reasons.py                  # 建议理由短句（兼容无 regime/signals 的入口）
+│   └── structured_reasoning.py     # 根据 regime、signals、risk、decision 生成结构化理由（无分数）
 │
 ├── ui_dashboard/                    # 6. 界面
 │   ├── __init__.py
@@ -68,7 +69,7 @@ etf_pilot/
 | **signal_engine** | 技术指标计算、仅产出状态/概率（如 oversold、strong_up、bullish），不产出买卖建议 | 评分、最终建议、UI |
 | **risk_engine** | 波动率状态、回撤、信号分歧、集中度 → 风险等级 LOW/MEDIUM/HIGH | 信号、决策、UI |
 | **decision_engine** | 组合信号状态 + **风险引擎等级** + 市场状态 → 买卖建议；依赖 risk_engine | 理由文案、UI、数据拉取 |
-| **explanation_engine** | 根据决策结果生成「建议理由」等展示文案 | 评分与决策逻辑、UI 样式 |
+| **explanation_engine** | 根据 regime、signals、risk、final decision 生成结构化、可读的「为什么」说明（不输出分数） | 评分计算、决策逻辑、UI 样式 |
 | **ui_dashboard** | 页面结构、组件、缓存、表格/图表展示与样式 | 业务规则、指标计算、决策逻辑 |
 
 ## 依赖方向

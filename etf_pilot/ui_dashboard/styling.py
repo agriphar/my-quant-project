@@ -37,27 +37,47 @@ def add_明日建议_warning_prefix(table_df: pd.DataFrame, df_display: pd.DataF
 
 
 def _row_style_simple(row: pd.Series, df_display: pd.DataFrame) -> list:
-    """单行背景色：样本极少/数据不足/明日建议类型。"""
+    """单行背景色：样本极少/数据不足/建议类型；信号分歧时加边框提示。"""
     if "样本极少" in df_display.columns:
         try:
             if df_display.loc[row.name, "样本极少"] is True:
                 return ["background-color: rgba(255,235,59,0.22)"] * len(row)
         except (KeyError, TypeError):
             pass
-    action = row.get("明日建议") if "明日建议" in row.index else None
-    if isinstance(action, str) and action.startswith("⚠️ "):
-        action = action.replace("⚠️ ", "")
-    if action and isinstance(action, str) and (
-        "有效数据仅" in action or "缺少 IOPV" in action or "溢价数据不足" in action
+    # 用内部「建议类型」判断行色，避免依赖展示文案
+    advice_type = None
+    if "建议类型" in df_display.columns:
+        try:
+            advice_type = df_display.loc[row.name, "建议类型"]
+        except (KeyError, TypeError):
+            pass
+    display_val = row.get("明日建议") if "明日建议" in row.index else None
+    if isinstance(display_val, str) and display_val.startswith("⚠️ "):
+        display_val = display_val.replace("⚠️ ", "")
+    if display_val and isinstance(display_val, str) and (
+        "有效数据仅" in display_val or "缺少 IOPV" in display_val or "溢价数据不足" in display_val or "数据不足" in display_val
     ):
         return ["background-color: rgba(255,152,0,0.2)"] * len(row)
-    if action == "强烈建议补仓":
+    if advice_type == "强烈建议补仓":
         return ["background-color: rgba(33,150,243,0.12)"] * len(row)
-    if action == "考虑套利/减仓":
+    if advice_type == "考虑套利/减仓":
         return ["background-color: rgba(156,39,176,0.12)"] * len(row)
-    if action == "极度过热，禁买":
+    if advice_type == "极度过热，禁买":
         return ["background-color: rgba(244,67,54,0.12)"] * len(row)
     return [""] * len(row)
+
+
+def _style_信号分歧(row_subset: pd.Series, df_display: pd.DataFrame) -> list:
+    """信号分歧列或明日建议列：存在分歧时高亮，提示综合判断。"""
+    idx = row_subset.name if hasattr(row_subset, "name") else None
+    if idx is None or "信号分歧" not in df_display.columns:
+        return [""]
+    try:
+        if df_display.loc[idx, "信号分歧"] is True:
+            return ["background-color: rgba(255,193,7,0.25); font-weight: 500;"]
+    except (KeyError, TypeError):
+        pass
+    return [""]
 
 
 def _style_premium_display_row(row_subset: pd.Series, df_display: pd.DataFrame):
@@ -86,7 +106,7 @@ def _style_明日建议_high_premium(row: pd.Series, df_display: pd.DataFrame) -
 
 def style_dashboard_table(table_df: pd.DataFrame, df_display: pd.DataFrame):
     """
-    对决策看板表格应用行样式、溢价列样式、明日建议列样式。
+    对决策看板表格应用行样式、溢价列样式、明日建议列样式、信号分歧高亮。
     返回 Styler，供 st.dataframe(styled, ...) 使用。
     """
     styled = table_df.style.apply(
@@ -103,6 +123,12 @@ def style_dashboard_table(table_df: pd.DataFrame, df_display: pd.DataFrame):
         styled = styled.apply(
             lambda r: _style_明日建议_high_premium(r, df_display),
             subset=["明日建议"],
+            axis=1,
+        )
+    if "信号分歧显示" in table_df.columns and "信号分歧" in df_display.columns:
+        styled = styled.apply(
+            lambda r: _style_信号分歧(r, df_display),
+            subset=["信号分歧显示"],
             axis=1,
         )
     return styled

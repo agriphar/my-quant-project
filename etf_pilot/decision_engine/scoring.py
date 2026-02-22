@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 from explanation_engine.reasons import get_reason_for_signal
+from explanation_engine.structured_reasoning import explain_decision
 from signal_engine.states import (
     MOMENTUM_OVERSOLD,
     MOMENTUM_NEUTRAL,
@@ -187,15 +188,53 @@ def state_to_score(signal_states: dict[str, str]) -> dict[str, float]:
     }
 
 
+def _confidence_band(
+    total: float,
+    strong_buy: float,
+    hold: float,
+    risk_level: str | None,
+    vetoed: bool,
+) -> str:
+    """
+    将分数与风险映射为信心区间（非精确分数），用于展示不确定性。
+    high / medium / low；高风险或一票否决时下调。
+    """
+    from risk_engine import RISK_HIGH
+
+    if vetoed:
+        return "low"
+    if total >= strong_buy:
+        return "medium" if risk_level == RISK_HIGH else "high"
+    if total >= hold:
+        return "low" if risk_level == RISK_HIGH else "medium"
+    return "low"
+
+
+def _display_label(action: str) -> str:
+    """
+    非确定性、行为金融友好的展示文案：避免「强烈建议」「必买/必卖」等措辞。
+    """
+    if action == "极度过热，禁买":
+        return "溢价过高，暂不参与"
+    if action == "强烈建议补仓":
+        return "偏多，可考虑补仓"
+    if action == "持有观望":
+        return "观望"
+    if action == "考虑套利/减仓":
+        return "偏空，可考虑减仓"
+    return action
+
+
 def get_advice(
     signal_states: dict[str, str],
     premium_deviation_val: float | None,
     market_regime: dict[str, str] | None = None,
     risk_level: str | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str, str]:
     """
     组合：信号状态 + 风险（溢价偏离度）+ 可选市场状态 + 风险引擎等级 → 明日建议与理由。
-    Decision Engine 依赖 Risk Engine：risk_level 为 HIGH 时提高强烈补仓/持有门槛。
+    返回 (action, reason, display_label, confidence_band)。
+    display_label 为界面用非确定性措辞；confidence_band 为 high/medium/low。
     """
     from risk_engine import RISK_HIGH, RISK_MEDIUM
 
@@ -221,8 +260,18 @@ def get_advice(
         action = "持有观望"
     else:
         action = "考虑套利/减仓"
-    reason = get_reason_for_signal(action, total, vetoed)
-    return action, reason
+    # 使用 Explanation Engine 的结构化理由（无分数描述）
+    explained = explain_decision(
+        regime=market_regime,
+        signal_states=signal_states,
+        risk_level=risk_level,
+        decision=action,
+        premium_vetoed=vetoed,
+    )
+    reason = explained["one_liner"]
+    display_label = _display_label(action)
+    confidence_band = _confidence_band(total, strong_buy, hold, risk_level, vetoed)
+    return action, reason, display_label, confidence_band
 
 
 def get_signal_from_score(

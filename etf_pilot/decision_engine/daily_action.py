@@ -69,7 +69,7 @@ def compute_daily_action(
     Decision Engine 依赖 Risk Engine：风险等级 HIGH 时提高强烈补仓/持有门槛。
     """
     if last.get("收盘") is None or pd.isna(last.get("收盘")):
-        return "持有观望", "数据不足"
+        return "持有观望", "数据不足", "观望", "low", False
     signal_states = get_signal_states(
         last,
         r2=r2,
@@ -84,12 +84,14 @@ def compute_daily_action(
         weight_pct=weight_pct,
     )
     dev = premium_deviation(premium_pct, avg_premium_22d, premium_std_22d)
-    return get_advice(
+    action, reason, display_label, confidence_band = get_advice(
         signal_states,
         dev,
         market_regime,
         risk_level=risk_result["level"],
     )
+    conflicting_signals = risk_result.get("signal_disagreement") == "HIGH"
+    return action, reason, display_label, confidence_band, conflicting_signals
 
 
 def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAYS) -> int:
@@ -102,7 +104,7 @@ def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAY
     tail = hist.tail(days)
     count = 0
     for _, row in tail.iterrows():
-        act, _ = compute_daily_action(row)
+        act, *_ = compute_daily_action(row)
         if act in ("强烈建议补仓", "考虑套利/减仓"):
             count += 1
     return count

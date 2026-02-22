@@ -124,11 +124,12 @@ def run():
 
     with tab_dashboard:
         st.subheader("行情透视 · 偏离度 · 明日建议（按建议操作频率排序）")
+        st.caption("结论为参考区间而非精确预测；存在信号分歧时请综合判断。")
         show_cols = [
             "代码", "名称", "最新价", "涨跌幅",
             "距一年高%", "距一年低%",
             "Bias_MA20", "Bias_MA60", "Bias_MA200",
-            "明日建议", "建议操作频率", "溢价率显示", "RSI", "信号准确率显示",
+            "明日建议", "信心区间", "信号分歧显示", "建议操作频率", "溢价率显示", "RSI", "信号准确率显示",
         ]
         show_cols = [c for c in show_cols if c in df_display.columns]
         table_df = df_display[show_cols].copy()
@@ -139,15 +140,18 @@ def run():
             styled,
             width="stretch",
             column_config={
-                "最新价": st.column_config.NumberColumn(format="%.4f"),
+                "最新价": st.column_config.NumberColumn(format="%.2f"),
                 "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
-                "距一年高%": st.column_config.NumberColumn(format="%.2f%%"),
-                "距一年低%": st.column_config.NumberColumn(format="%.2f%%"),
-                "Bias_MA20": st.column_config.NumberColumn(format="%.2f%%"),
-                "Bias_MA60": st.column_config.NumberColumn(format="%.2f%%"),
-                "Bias_MA200": st.column_config.NumberColumn(format="%.2f%%"),
+                "距一年高%": st.column_config.NumberColumn(format="%.1f%%"),
+                "距一年低%": st.column_config.NumberColumn(format="%.1f%%"),
+                "Bias_MA20": st.column_config.NumberColumn(format="%.1f%%"),
+                "Bias_MA60": st.column_config.NumberColumn(format="%.1f%%"),
+                "Bias_MA200": st.column_config.NumberColumn(format="%.1f%%"),
+                "明日建议": st.column_config.TextColumn("明日建议"),
+                "信心区间": st.column_config.TextColumn("信心"),
+                "信号分歧显示": st.column_config.TextColumn("信号分歧"),
                 "溢价率显示": st.column_config.TextColumn("溢价率"),
-                "RSI": st.column_config.NumberColumn(format="%.1f"),
+                "RSI": st.column_config.NumberColumn(format="%.0f"),
                 "信号准确率显示": st.column_config.TextColumn("准确率30d"),
             },
             hide_index=True,
@@ -162,11 +166,15 @@ def run():
             sel_mask = df_display["代码"].astype(str) == code
             if code and sel_mask.any():
                 sel_row = df_display.loc[sel_mask].iloc[0]
-                action = sel_row.get("明日建议", "持有观望")
+                display_label = sel_row.get("明日建议", "观望")
                 reason = sel_row.get("建议理由", "")
                 name = sel_row.get("名称", "")
-                st.info(f"**明天建议：{action}**  \n理由：{reason}")
-                st.caption(f"标的：{name}")
+                confidence = sel_row.get("信心区间", "—")
+                conflicting = sel_row.get("信号分歧", False)
+                st.info(f"**参考结论：{display_label}**  \n理由：{reason}")
+                st.caption(f"标的：{name} · 信心区间：{confidence}")
+                if conflicting:
+                    st.warning("当前存在信号分歧，多因子方向不一致，请综合判断后再做决策。")
 
     with tab_radar:
         st.caption("实时行情：最新价、涨跌幅与均线/RSI 等具体数据（与决策看板不重复）")
@@ -178,13 +186,13 @@ def run():
             radar_styled,
             width="stretch",
             column_config={
-                "最新价": st.column_config.NumberColumn(format="%.4f"),
+                "最新价": st.column_config.NumberColumn(format="%.2f"),
                 "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
-                "MA5": st.column_config.NumberColumn(format="%.4f"),
-                "MA20": st.column_config.NumberColumn(format="%.4f"),
-                "MA60": st.column_config.NumberColumn(format="%.4f"),
-                "MA200": st.column_config.NumberColumn(format="%.4f"),
-                "RSI": st.column_config.NumberColumn(format="%.1f"),
+                "MA5": st.column_config.NumberColumn(format="%.2f"),
+                "MA20": st.column_config.NumberColumn(format="%.2f"),
+                "MA60": st.column_config.NumberColumn(format="%.2f"),
+                "MA200": st.column_config.NumberColumn(format="%.2f"),
+                "RSI": st.column_config.NumberColumn(format="%.0f"),
             },
             hide_index=True,
         )
@@ -249,8 +257,9 @@ def run():
         st.subheader("过去 30 天信号准确率")
         st.markdown("""
         - **锚定实战价格**：基于**场内收盘价 (Close)**，不使用 IOPV/净值。
-        - **有效信号**：仅统计「强烈建议补仓」「考虑套利/减仓」的样本，**持有观望不计入准确率分母**。
-        - **准确定义**：发出买入信号后 5 日内价格上涨，或发出卖出信号后 5 日内价格下跌，则视为准确。
+        - **有效信号**：仅统计偏多/偏空方向出现时的样本，**观望不计入准确率分母**。
+        - **准确定义**：偏多信号后 5 日内价格上涨，或偏空信号后 5 日内价格下跌，则视为该次信号准确。
+        - 准确率为历史统计，不代表未来表现；结论存在不确定性。
         """)
         acc_cols = ["代码", "名称", "明日建议", "建议操作频率", "信号准确率显示"]
         acc_cols = [c for c in acc_cols if c in df_display.columns]
@@ -264,7 +273,7 @@ def run():
                 },
                 hide_index=True,
             )
-            st.caption("当前准确率仅基于「补仓」与「减仓」两类实战建议得出的真实胜率，维持观望不计入分母。")
+            st.caption("准确率基于偏多/偏空方向的历史胜率，观望不计入分母；仅供参考，不保证未来结果。")
 
     st.divider()
     st.caption(f"ETF 列表：{ETF_LIST_PATH}")

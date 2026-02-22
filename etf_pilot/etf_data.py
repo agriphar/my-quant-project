@@ -469,6 +469,7 @@ def build_monitor_table_advanced(
                 "距一年高%": None, "距一年低%": None,
                 "Bias_MA20": None, "Bias_MA60": None, "Bias_MA200": None,
                 "明日建议": "—", "建议理由": "",
+                "信心区间": "—", "信号分歧": False, "信号分歧显示": "—", "建议类型": "持有观望",
                 "建议操作频率": 0,
                 "溢价率": premium_pct if premium_pct is not None else None,
                 "溢价率均值22d": None,
@@ -517,6 +518,9 @@ def build_monitor_table_advanced(
             bias_200 = bias_pct(float(close) if close is not None else None, last.get("MA200"))
             if action_no_nav is not None:
                 action, reason = action_no_nav, (reason_no_nav or "接口未返回 IOPV/净值列或数据全为空")
+                display_label = "仅参考实时溢价" if "仅参考实时溢价" in (action_no_nav or "") else "数据不足"
+                confidence_band, conflicting_signals = "low", False
+                advice_type = "持有观望"
             else:
                 atr_pct = None
                 if last.get("ATR") is not None and last.get("收盘") and float(last.get("收盘", 0) or 0) > 0:
@@ -532,7 +536,7 @@ def build_monitor_table_advanced(
                             pct_drawdown_from_high = (float(high_60d) - float(close)) / float(high_60d) * 100
                         except (TypeError, ValueError):
                             pass
-                action, reason = compute_daily_action(
+                action, reason, display_label, confidence_band, conflicting_signals = compute_daily_action(
                     last,
                     premium_pct=premium_pct,
                     avg_premium_22d=avg_premium_22d,
@@ -543,10 +547,14 @@ def build_monitor_table_advanced(
                     atr_pct=atr_pct,
                     pct_drawdown_from_high=pct_drawdown_from_high,
                 )
+                advice_type = action
                 if no_premium_data and premium_valid_count == 0:
-                    action = "溢价数据不足"
+                    action, display_label, confidence_band, conflicting_signals = "溢价数据不足", "溢价数据不足", "low", False
+                    advice_type = "持有观望"
                 elif premium_pctile_60d is None and premium_valid_count == 0 and not no_premium_data:
-                    action = "溢价数据不足"
+                    action, display_label, confidence_band, conflicting_signals = "溢价数据不足", "溢价数据不足", "low", False
+                    advice_type = "持有观望"
+            confidence_band_cn = {"high": "高", "medium": "中", "low": "低"}.get(confidence_band, "—")
             freq = compute_action_frequency(hist, SIGNAL_LOOKBACK_DAYS)
             acc_result = compute_signal_accuracy_30d(hist, nav_hist)
             acc = acc_result.get("信号准确率30d")
@@ -567,7 +575,8 @@ def build_monitor_table_advanced(
                 "距一年高%": round(pct_high, 2) if pct_high is not None else None,
                 "距一年低%": round(pct_low, 2) if pct_low is not None else None,
                 "Bias_MA20": bias_20, "Bias_MA60": bias_60, "Bias_MA200": bias_200,
-                "明日建议": action, "建议理由": reason,
+                "明日建议": display_label, "建议理由": reason,
+                "信心区间": confidence_band_cn, "信号分歧": conflicting_signals, "信号分歧显示": "是" if conflicting_signals else "—", "建议类型": advice_type,
                 "建议操作频率": freq,
                 "溢价率": premium_pct,
                 "溢价率均值22d": avg_premium_22d,
@@ -588,6 +597,7 @@ def build_monitor_table_advanced(
                 "距一年高%": None, "距一年低%": None,
                 "Bias_MA20": None, "Bias_MA60": None, "Bias_MA200": None,
                 "明日建议": "—", "建议理由": "",
+                "信心区间": "—", "信号分歧": False, "信号分歧显示": "—", "建议类型": "持有观望",
                 "建议操作频率": 0,
                 "溢价率": premium_pct if premium_pct is not None else None,
                 "溢价率均值22d": None,

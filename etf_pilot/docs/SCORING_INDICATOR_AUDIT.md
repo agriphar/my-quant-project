@@ -1,84 +1,84 @@
-# Scoring Indicator Audit — Factor Exposure & Redundancy
+# 评分指标审计 — 因子暴露与冗余
 
-## 1. Original indicators used in scoring (before audit)
+## 1. 审计前评分所用指标
 
-| Indicator | Input | Score range | Current bucket |
-|-----------|--------|-------------|-----------------|
-| RSI | last_row["RSI"] | 0 ~ 1.33 | tech (momentum) |
-| Bias_MA20 | (close - MA20) / MA20 * 100 | 0 ~ 1.33 | tech (momentum) |
-| Bias_MA200 | (close - MA200) / MA200 * 100 | 0 ~ 1.34 | tech (trend position) |
-| R² (180d regression) | linear regression fit | 0 ~ 3 (with slope) | trend |
-| Slope (180d regression) | linear regression slope | 0 ~ 3 (with R²) | trend |
-| Premium 60d percentile | 溢价分位60d | 0 ~ 3 | premium (valuation) |
-| Premium deviation | (current - mean22) / std22 | veto only (>2.5) | valuation (safety) |
+| 指标 | 输入 | 分值范围 | 当前归属 |
+|------|------|----------|----------|
+| RSI | last_row["RSI"] | 0 ~ 1.33 | tech（动量） |
+| Bias_MA20 | (close - MA20) / MA20 * 100 | 0 ~ 1.33 | tech（动量） |
+| Bias_MA200 | (close - MA200) / MA200 * 100 | 0 ~ 1.34 | tech（趋势位置） |
+| R²（180d 回归） | 线性回归拟合度 | 0 ~ 3（与 slope 共用） | trend |
+| Slope（180d 回归） | 线性回归斜率 | 0 ~ 3（与 R² 共用） | trend |
+| 溢价 60d 分位 | 溢价分位60d | 0 ~ 3 | premium（估值） |
+| 溢价偏离度 | (当前 - 22日均值) / 22日标准差 | 仅否决（>2.5） | valuation（安全） |
 
-**Total score:** tech 4 + trend 3 + premium 3 = 10.
-
----
-
-## 2. Grouping by underlying factor exposure
-
-### Trend (directional persistence / long-term direction)
-- **R² + slope** — 180d linear regression: fit (R²) and direction (slope). Pure trend strength and direction.
-- **Bias_MA200** — Price vs 200d average. Measures “where price is” relative to long-term trend.
-
-**Redundancy:** High correlation. When trend is strong and up (high R², slope > 0), price is often above MA200 (positive Bias_MA200). When trend is down, price is often below MA200. Both capture “trend”; one is regression-based, one is level vs MA. **Keep one:** R² + slope (more interpretable: fit + direction). **Remove from score:** Bias_MA200.
-
-### Momentum (short-term speed / overbought–oversold)
-- **RSI** — Rate of price changes over 14d; oversold/overbought.
-- **Bias_MA20** — (Close - MA20) / MA20; short-term deviation from 20d average.
-
-**Redundancy:** Correlated. In uptrends, high RSI often coincides with positive Bias_MA20; in mean reversion both reward “not overbought” and “near or below MA20”. Both are short-horizon. **Keep one:** RSI (standard, single momentum signal). **Remove from score:** Bias_MA20.
-
-### Valuation (relative cheapness / premium)
-- **Premium 60d percentile** — Where current premium sits vs last 60d. Low = cheap, high = expensive.
-- **Premium deviation** — Z-score vs 22d; used only as veto (>2.5 = 极度过热，禁买). Not a score component.
-
-**Redundancy:** None. One level (percentile), one safety (deviation veto). **Keep both:** percentile in score, deviation as veto only.
-
-### Volatility (uncertainty / range)
-- **None in score.** ATR and Bollinger exist in codebase but are not used in scoring.
-
-**Gap:** Volatility carries different information (regime risk, not trend/momentum/valuation). **Add one:** ATR% (ATR/close × 100) so that high vol reduces score, low vol is neutral/slight positive.
+**总分构成：** tech 4 + trend 3 + premium 3 = 10。
 
 ---
 
-## 3. Correlated pairs and action
+## 2. 按底层因子暴露分组
 
-| Pair | Correlation / overlap | Action |
-|------|------------------------|--------|
-| R²+slope vs Bias_MA200 | Both trend; R²+slope = fit+direction, Bias_MA200 = level vs long-term MA | **Drop Bias_MA200** from score |
-| RSI vs Bias_MA20 | Both short-term; RSI = change, Bias_MA20 = level vs MA20 | **Drop Bias_MA20** from score |
-| Premium pctile vs premium deviation | Different roles (level vs extreme) | Keep both (pctile in score, deviation as veto) |
+### 趋势（方向持续性 / 长期方向）
+- **R² + slope** — 180 日线性回归：拟合度（R²）与方向（slope）。纯趋势强度与方向。
+- **Bias_MA200** — 价格相对 200 日均线。衡量价格在长期趋势中的相对位置。
 
----
+**冗余：** 相关性高。趋势强且向上（高 R²、slope > 0）时，价格常高于 MA200（Bias_MA200 为正）；趋势向下时价格常低于 MA200。两者都在刻画「趋势」：一个基于回归，一个基于价格与均线水平。**保留一个：** R² + slope（更易解释：拟合度 + 方向）。**从评分中移除：** Bias_MA200。
 
-## 4. Target factor structure (one indicator per factor)
+### 动量（短期速度 / 超买超卖）
+- **RSI** — 14 日价格变化速率；超卖/超买。
+- **Bias_MA20** — (收盘 - MA20) / MA20；相对 20 日均线的短期偏离。
 
-| Factor | Single indicator | Score weight | Rationale |
-|--------|-------------------|--------------|-----------|
-| **Trend** | R² + slope (180d) | 3 | Directional persistence; no second trend measure. |
-| **Momentum** | RSI | 2 | One short-term momentum/overbought signal. |
-| **Valuation** | Premium 60d percentile | 3 | Relative premium level. |
-| **Volatility** | ATR% (ATR/close × 100) | 2 | Distinct risk/regime signal. |
+**冗余：** 相关。上涨趋势中高 RSI 常伴随正 Bias_MA20；均值回归时两者都奖励「未超买」和「接近或低于 MA20」。均为短周期。**保留一个：** RSI（标准、单一动量信号）。**从评分中移除：** Bias_MA20。
 
-**Total:** 3 + 2 + 3 + 2 = 10.  
-**Veto unchanged:** premium deviation > 2.5 → 极度过热，禁买.
+### 估值（相对便宜度 / 溢价）
+- **溢价 60d 分位** — 当前溢价在过去 60 日中的位置。低=便宜，高=贵。
+- **溢价偏离度** — 相对 22 日的 Z 分数；仅用于否决（>2.5 = 极度过热，禁买）。不参与计分。
 
----
+**冗余：** 无。一个看水平（分位），一个看安全（偏离度否决）。**两者保留：** 分位参与评分，偏离度仅作否决。
 
-## 5. Indicators kept for display only (not in score)
+### 波动（不确定性 / 波动区间）
+- **评分中未使用。** 代码中有 ATR、布林带，但未参与评分。
 
-- **Bias_MA20, Bias_MA60, Bias_MA200** — Still computed and shown in UI; no longer inputs to `calculate_score`.
-- **距一年高% / 距一年低%** — Display only; not used in score (would overlap with momentum/trend if added).
+**缺口：** 波动提供不同信息（状态/风险，而非趋势/动量/估值）。**新增一个：** ATR%（ATR/收盘 × 100），高波动降分，低波动中性或略加分。
 
 ---
 
-## 6. Volatility scoring rule (ATR%)
+## 3. 相关指标对与处理
 
-- **ATR%** = ATR(14) / close × 100.
-- Low ATR% (e.g. &lt; 1.5): calm regime → neutral/slight positive (2).
-- High ATR% (e.g. &gt; 3): high uncertainty → lower score (0).
-- Mid: linear or step in between (e.g. 1).
+| 指标对 | 相关性 / 重叠 | 处理 |
+|--------|----------------|------|
+| R²+slope vs Bias_MA200 | 均为趋势；R²+slope=拟合+方向，Bias_MA200=相对长期均线水平 | **从评分中剔除 Bias_MA200** |
+| RSI vs Bias_MA20 | 均为短期；RSI=变化率，Bias_MA20=相对 MA20 水平 | **从评分中剔除 Bias_MA20** |
+| 溢价分位 vs 溢价偏离度 | 角色不同（水平 vs 极端） | 保留两者（分位参与评分，偏离度仅否决） |
 
-Thresholds are configurable in `decision_engine/scoring.py`.
+---
+
+## 4. 目标因子结构（每因子一指标）
+
+| 因子 | 单一指标 | 分值权重 | 说明 |
+|------|----------|----------|------|
+| **趋势** | R² + slope（180d） | 3 | 方向持续性；不再使用第二项趋势指标。 |
+| **动量** | RSI | 2 | 单一短期动量/超买信号。 |
+| **估值** | 溢价 60d 分位 | 3 | 相对溢价水平。 |
+| **波动** | ATR%（ATR/收盘 × 100） | 2 | 独立的风险/状态信号。 |
+
+**总分：** 3 + 2 + 3 + 2 = 10。  
+**否决规则不变：** 溢价偏离度 > 2.5 → 极度过热，禁买。
+
+---
+
+## 5. 仅展示、不参与评分的指标
+
+- **Bias_MA20、Bias_MA60、Bias_MA200** — 仍计算并在界面展示；不再作为 `calculate_score` 的输入。
+- **距一年高% / 距一年低%** — 仅展示；不参与评分（若加入会与动量/趋势重叠）。
+
+---
+
+## 6. 波动评分规则（ATR%）
+
+- **ATR%** = ATR(14) / 收盘 × 100。
+- 低 ATR%（如 &lt; 1.5）：波动小 → 中性或略加分（2）。
+- 高 ATR%（如 &gt; 3）：不确定性高 → 降分（0）。
+- 中间：线性或阶梯插值（如 1）。
+
+阈值可在 `decision_engine/scoring.py` 中配置。
