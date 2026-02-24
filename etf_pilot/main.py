@@ -47,7 +47,7 @@ st.caption("本项目仅供学习和研究使用，不构成任何投资建议�
 ensure_data_dir()
 etf_list_full = load_etf_list()
 if etf_list_full.empty:
-    st.warning("未找到有效的 ETF 列表，请检查 data/ETF汇总.xlsx 是否包含「代码」「名称」列。")
+    st.warning("未找到有效的 ETF 列表，请检查 d想·ata/ETF汇总.xlsx 是否包含「代码」「名称」列。")
     st.stop()
 
 # ---------- Sidebar ----------
