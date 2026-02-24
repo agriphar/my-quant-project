@@ -101,17 +101,24 @@ def run():
         df_etf = pd.DataFrame(records)
         return _cached_build(df_etf, days=days, ma_short=ma_short, ma_long=ma_long)
 
-    with st.spinner("正在拉取日线与 IOPV 实时估值，计算行情透视、偏离度、溢价率与操作建议…"):
-        try:
-            df_full = _cached_build_table(
-                etf_list_full.to_dict("records"),
-                days=days,
-                ma_short=int(ma_short),
-                ma_long=int(ma_long),
-            )
-        except Exception as e:
-            st.error(f"拉取数据失败：{e}")
-            st.stop()
+    # 仅当 ETF 列表或 MA/天数 变化时重新拉数；切换类别时直接用已缓存的 df_full，避免重复刷新
+    table_key = (tuple(sorted(etf_list_full["代码"].astype(str))), days, int(ma_short), int(ma_long))
+    if st.session_state.get("_table_key") != table_key or "_table_df_full" not in st.session_state:
+        with st.spinner("正在拉取日线与 IOPV 实时估值，计算行情透视、偏离度、溢价率与操作建议…"):
+            try:
+                df_full = _cached_build_table(
+                    etf_list_full.to_dict("records"),
+                    days=days,
+                    ma_short=int(ma_short),
+                    ma_long=int(ma_long),
+                )
+                st.session_state._table_key = table_key
+                st.session_state._table_df_full = df_full
+            except Exception as e:
+                st.error(f"拉取数据失败：{e}")
+                st.stop()
+    else:
+        df_full = st.session_state._table_df_full
 
     df = filter_by_category(df_full, selected_category, CATEGORY_ALL, CATEGORY_KEYWORDS)
     if df.empty:
@@ -134,13 +141,20 @@ def run():
         show_cols = [c for c in show_cols if c in df_display.columns]
         table_df = df_display[show_cols].copy()
         table_df = add_明日建议_warning_prefix(table_df, df_display)
-        table_df = table_df.replace([np.inf, -np.inf], np.nan).fillna("-")
+        table_df = table_df.replace([np.inf, -np.inf], np.nan)
+        # 仅对非数值列用 "—" 填充空值；数值列强制为 float，保证 PyArrow 可序列化
+        num_cols = {"最新价", "涨跌幅", "距一年高%", "距一年低%", "Bias_MA20", "Bias_MA60", "Bias_MA200", "RSI", "建议操作频率"}
+        for col in table_df.columns:
+            if col in num_cols:
+                table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
+            elif table_df[col].dtype == object:
+                table_df[col] = table_df[col].fillna("—")
         styled = style_dashboard_table(table_df, df_display)
         st.dataframe(
             styled,
             width="stretch",
             column_config={
-                "最新价": st.column_config.NumberColumn(format="%.2f"),
+                "最新价": st.column_config.NumberColumn(format="%.3f"),
                 "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
                 "距一年高%": st.column_config.NumberColumn(format="%.1f%%"),
                 "距一年低%": st.column_config.NumberColumn(format="%.1f%%"),
@@ -181,17 +195,21 @@ def run():
         radar_cols = ["代码", "名称", "最新价", "涨跌幅", "MA5", "MA20", "MA60", "MA200", "RSI"]
         radar_cols = [c for c in radar_cols if c in df_display.columns]
         radar_df = df_display[radar_cols].copy()
+        radar_num = {"最新价", "涨跌幅", "MA5", "MA20", "MA60", "MA200", "RSI"}
+        for col in radar_num:
+            if col in radar_df.columns:
+                radar_df[col] = pd.to_numeric(radar_df[col], errors="coerce")
         radar_styled = style_radar_rsi(radar_df)
         st.dataframe(
             radar_styled,
             width="stretch",
             column_config={
-                "最新价": st.column_config.NumberColumn(format="%.2f"),
+                "最新价": st.column_config.NumberColumn(format="%.3f"),
                 "涨跌幅": st.column_config.NumberColumn(format="%.2f%%"),
-                "MA5": st.column_config.NumberColumn(format="%.2f"),
-                "MA20": st.column_config.NumberColumn(format="%.2f"),
-                "MA60": st.column_config.NumberColumn(format="%.2f"),
-                "MA200": st.column_config.NumberColumn(format="%.2f"),
+                "MA5": st.column_config.NumberColumn(format="%.3f"),
+                "MA20": st.column_config.NumberColumn(format="%.3f"),
+                "MA60": st.column_config.NumberColumn(format="%.3f"),
+                "MA200": st.column_config.NumberColumn(format="%.3f"),
                 "RSI": st.column_config.NumberColumn(format="%.0f"),
             },
             hide_index=True,
@@ -264,7 +282,12 @@ def run():
         acc_cols = ["代码", "名称", "明日建议", "建议操作频率", "信号准确率显示"]
         acc_cols = [c for c in acc_cols if c in df_display.columns]
         if acc_cols:
-            acc_df = df_display[acc_cols].copy().replace([np.inf, -np.inf], np.nan).fillna("-")
+            acc_df = df_display[acc_cols].copy().replace([np.inf, -np.inf], np.nan)
+            if "建议操作频率" in acc_df.columns:
+                acc_df["建议操作频率"] = pd.to_numeric(acc_df["建议操作频率"], errors="coerce")
+            for col in acc_df.columns:
+                if acc_df[col].dtype == object:
+                    acc_df[col] = acc_df[col].fillna("—")
             st.dataframe(
                 acc_df,
                 width="stretch",

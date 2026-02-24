@@ -9,7 +9,16 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 
-from config.settings import RSI_PERIOD, BB_PERIOD, BB_STD
+from config.settings import (
+    RSI_PERIOD,
+    BB_PERIOD,
+    BB_STD,
+    DATA_SOURCE,
+    REQUEST_DELAY_SECONDS,
+    REQUEST_RETRIES,
+    REQUEST_RETRY_DELAY_SECONDS,
+    to_sina_symbol,
+)
 from market_regime.trend import compute_trend_classification, REGRESSION_WINDOW
 from signal_engine.indicators import rsi, bollinger, atr, pct_from_1y_high_low, bias_pct
 from decision_engine.daily_action import (
@@ -23,6 +32,39 @@ from risk_engine import drawdown_15pct_value  # 向后兼容：原 etf_data 对�
 DATA_DIR = Path(__file__).resolve().parent / "data"
 ETF_LIST_PATH = DATA_DIR / "ETF汇总.xlsx"
 logger = logging.getLogger(__name__)
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """是否为可重试的连接类错误（服务器断开、限流等）。"""
+    msg = str(exc).lower()
+    if "remotedisconnected" in msg or "connection aborted" in msg or "connection reset" in msg:
+        return True
+    try:
+        import requests
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _request_with_retry(func, *args, retries=None, retry_delay=None, **kwargs):
+    """对可能被服务器断开的请求做有限次重试。"""
+    retries = retries if retries is not None else REQUEST_RETRIES
+    retry_delay = retry_delay if retry_delay is not None else REQUEST_RETRY_DELAY_SECONDS
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1 and _is_connection_failure(e):
+                logger.debug("请求失败第 %s/%s 次，%s 秒后重试: %s", attempt + 1, retries, retry_delay, e)
+                time.sleep(retry_delay)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
 
 # 场内基金当日净值页缓存，用于历史净值接口返回全 NaN 时的兜底（仅能拿到最近 1～2 个交易日）
 _daily_em_cache: pd.DataFrame | None = None
@@ -91,16 +133,17 @@ def load_etf_list() -> pd.DataFrame:
 
 
 def _normalize_hist(raw: pd.DataFrame) -> pd.DataFrame | None:
-    """统一列为 日期、收盘、成交量。"""
+    """统一列为 日期、收盘、成交量。支持东方财富（日期/收盘）与新浪（date/close）列名。"""
     if raw is None or raw.empty:
         return None
     raw = raw.rename(columns=lambda c: str(c).strip())
-    date_col = "日期" if "日期" in raw.columns else (raw.columns[0] if len(raw.columns) else None)
-    close_col = next((c for c in ["收盘", "收盘价"] if c in raw.columns), None)
+    date_col = next((c for c in ["日期", "date"] if c in raw.columns), raw.columns[0] if len(raw.columns) else None)
+    close_col = next((c for c in ["收盘", "收盘价", "close"] if c in raw.columns), None)
     if not date_col or not close_col:
         return None
     df = raw.rename(columns={date_col: "日期", close_col: "收盘"})
-    df["成交量"] = raw["成交量"] if "成交量" in raw.columns else np.nan
+    vol_col = next((c for c in ["成交量", "volume"] if c in raw.columns), None)
+    df["成交量"] = raw[vol_col] if vol_col is not None else np.nan
     df["日期"] = pd.to_datetime(df["日期"])
     return df[["日期", "收盘", "成交量"]].copy()
 
@@ -308,56 +351,67 @@ def get_etf_premium_stats(
     )
 
 
-def get_etf_spot_premium_map(etf_codes: list[str]) -> dict[str, float]:
+def get_etf_spot_premium_map(
+    etf_codes: list[str],
+    sina_price_map: dict[str, tuple[float | None, float | None]] | None = None,
+) -> dict[str, float]:
     """
-    通过东方财富 fund_etf_spot_em 获取 IOPV 实时估值，计算溢价率。
-    溢价率 = (当前市价 - IOPV) / IOPV * 100%
-    返回 {代码: 溢价率%}，缺失或无效的代码不出现或可后续用 None 表示。
+    获取实时溢价率。DATA_SOURCE=em 时用东方财富 IOPV；DATA_SOURCE=sina 时用新浪实时价+净值估算。
+    公式：溢价率 = (市价 - 参考净值或IOPV) / 参考净值或IOPV × 100%，与国泰/海通等常用口径一致；
+    若券商显示为 IOPV 实时估值而本处用单位净值估算，或数据源/时点不同，会有小幅差异。保留三位小数便于对照。
+    返回 {代码: 溢价率%}。sina_price_map 为 DATA_SOURCE=sina 时传入的 代码->(最新价,涨跌幅)。
     """
     codes_set = {str(c).strip() for c in etf_codes if c}
     out = {}
-    try:
-        spot = ak.fund_etf_spot_em()
-    except Exception:
-        return out
-    if spot is None or spot.empty:
-        return out
-    spot = spot.rename(columns=lambda c: str(c).strip())
-    price_col = "最新价"
-    iopv_col = "IOPV实时估值"
-    code_col = "代码"
-    if code_col not in spot.columns or price_col not in spot.columns or iopv_col not in spot.columns:
-        return out
-    for _, r in spot.iterrows():
-        code = str(r.get(code_col, "")).strip()
-        if code not in codes_set:
-            continue
+    spot = None
+    if DATA_SOURCE != "sina":
         try:
-            price = r.get(price_col)
-            iopv = r.get(iopv_col)
-            if pd.isna(price) or pd.isna(iopv) or iopv is None or float(iopv) <= 0:
-                continue
-            price, iopv = float(price), float(iopv)
-            premium = (price - iopv) / iopv * 100
-            out[code] = round(premium, 2)
-        except (TypeError, ValueError):
-            continue
+            spot = _request_with_retry(ak.fund_etf_spot_em)
+        except Exception as e:
+            logger.warning("get_etf_spot_premium_map 调用 fund_etf_spot_em 失败: %s", e, exc_info=True)
+    if spot is not None and not spot.empty:
+        spot = spot.rename(columns=lambda c: str(c).strip())
+        price_col = "最新价"
+        iopv_col = "IOPV实时估值"
+        code_col = "代码"
+        if code_col in spot.columns and price_col in spot.columns and iopv_col in spot.columns:
+            for _, r in spot.iterrows():
+                code = str(r.get(code_col, "")).strip()
+                if code not in codes_set:
+                    continue
+                try:
+                    price = r.get(price_col)
+                    iopv = r.get(iopv_col)
+                    if pd.isna(price) or pd.isna(iopv) or iopv is None or float(iopv) <= 0:
+                        continue
+                    price, iopv = float(price), float(iopv)
+                    premium = (price - iopv) / iopv * 100
+                    out[code] = round(premium, 3)
+                except (TypeError, ValueError):
+                    continue
     missing = codes_set - set(out.keys())
     for code in missing:
         try:
             nav_hist = get_etf_nav_hist(code, 10)
-            hist = fetch_etf_daily(code, days=10)
-            if nav_hist is not None and not nav_hist.empty and hist is not None and not hist.empty:
-                last_nav = nav_hist.iloc[-1]["单位净值"]
-                if "收盘" in hist.columns and last_nav and float(last_nav) > 0:
+            if nav_hist is None or nav_hist.empty:
+                continue
+            last_nav = nav_hist.iloc[-1].get("单位净值")
+            if last_nav is None or pd.isna(last_nav) or float(last_nav) <= 0:
+                continue
+            last_nav_f = float(last_nav)
+            # 优先用传入的新浪实时价（当日价），否则用日线最后一根收盘（可能滞后）
+            current_price = None
+            if sina_price_map and code in sina_price_map:
+                current_price = sina_price_map[code][0] if isinstance(sina_price_map[code], (tuple, list)) else None
+            if current_price is None or pd.isna(current_price):
+                hist = fetch_etf_daily(code, days=10)
+                if hist is not None and not hist.empty and "收盘" in hist.columns:
                     last_close = hist.iloc[-1]["收盘"]
                     if last_close is not None and not pd.isna(last_close):
-                        premium = (float(last_close) - float(last_nav)) / float(last_nav) * 100
-                        out[code] = round(premium, 2)
-                        logger.debug(
-                            "get_etf_spot_premium_map %s: 使用日线+最近净值估算溢价 (无 IOPV)",
-                            code,
-                        )
+                        current_price = float(last_close)
+            if current_price is not None:
+                premium = (current_price - last_nav_f) / last_nav_f * 100
+                out[code] = round(premium, 3)
         except Exception:
             continue
     return out
@@ -366,12 +420,12 @@ def get_etf_spot_premium_map(etf_codes: list[str]) -> dict[str, float]:
 def format_premium_with_bar(premium_pct: float | None, pctile_60: float | None, bar_len: int = 10) -> str:
     """
     溢价率显示：数字 + 百分位进度条（满格=近期最贵）。
-    例如 "2.30% ████████░░ 80"
+    公式：溢价率 = (市价 - 参考净值/IOPV) / 参考净值/IOPV × 100%，与多数券商一致；保留三位小数便于对照。
     """
     if premium_pct is None or pd.isna(premium_pct):
         return "—"
     pct = float(pctile_60) if pctile_60 is not None and not pd.isna(pctile_60) else None
-    s = f"{float(premium_pct):.2f}%"
+    s = f"{float(premium_pct):.3f}%"
     if pct is not None and 0 <= pct <= 100:
         filled = int(round(bar_len * pct / 100))
         filled = min(bar_len, max(0, filled))
@@ -392,18 +446,43 @@ def fetch_etf_daily(
     start_date = end_date - timedelta(days=need_days)
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
-    try:
-        raw = ak.fund_etf_hist_em(
-            symbol=symbol.strip(),
-            period="daily",
-            start_date=start_str,
-            end_date=end_str,
-            adjust="qfq",
-        )
-    except Exception:
-        return None
-    if raw is None or raw.empty:
-        return None
+    raw = None
+
+    if DATA_SOURCE == "sina":
+        def _do_fetch_sina():
+            return ak.fund_etf_hist_sina(symbol=to_sina_symbol(symbol))
+        try:
+            raw = _request_with_retry(_do_fetch_sina)
+        except Exception as e:
+            logger.warning("fetch_etf_daily(sina) 失败 symbol=%s: %s", symbol, e, exc_info=True)
+            return None
+        if raw is None or raw.empty:
+            return None
+        raw = raw.rename(columns={
+            "date": "日期", "open": "开盘", "high": "最高", "low": "最低", "close": "收盘", "volume": "成交量",
+        })
+        raw["日期"] = pd.to_datetime(raw["日期"])
+        raw = raw[(raw["日期"].dt.strftime("%Y%m%d") >= start_str) & (raw["日期"].dt.strftime("%Y%m%d") <= end_str)]
+        if raw.empty:
+            return None
+    else:
+        def _do_fetch():
+            return ak.fund_etf_hist_em(
+                symbol=symbol.strip(),
+                period="daily",
+                start_date=start_str,
+                end_date=end_str,
+                adjust="qfq",
+            )
+        try:
+            raw = _request_with_retry(_do_fetch)
+        except Exception as e:
+            logger.warning("fetch_etf_daily 失败 symbol=%s: %s", symbol, e, exc_info=True)
+            return None
+        if raw is None or raw.empty:
+            return None
+        raw = raw.rename(columns=lambda c: str(c).strip())
+
     df = _normalize_hist(raw)
     if df is None or df.empty:
         return None
@@ -434,6 +513,33 @@ def fetch_etf_daily(
     return df
 
 
+def _get_sina_spot_map() -> dict[str, tuple[float | None, float | None]]:
+    """DATA_SOURCE=sina 时，拉取新浪 ETF 实时行情表，返回 代码(6位) -> (最新价, 涨跌幅%)。"""
+    out = {}
+    try:
+        spot = _request_with_retry(lambda: ak.fund_etf_category_sina(symbol="ETF基金"))
+    except Exception as e:
+        logger.debug("新浪 ETF 实时行情 fund_etf_category_sina 失败: %s", e)
+        return out
+    if spot is None or spot.empty or "代码" not in spot.columns or "最新价" not in spot.columns:
+        return out
+    spot = spot.rename(columns=lambda c: str(c).strip())
+    for _, r in spot.iterrows():
+        c = str(r.get("代码", "")).strip()
+        c6 = c[-6:] if len(c) >= 6 else c.replace("sh", "").replace("sz", "").strip()
+        if not c6 or len(c6) != 6:
+            continue
+        try:
+            price = r.get("最新价")
+            pct = r.get("涨跌幅")
+            price = float(price) if price is not None and not pd.isna(price) else None
+            pct = float(pct) if pct is not None and not pd.isna(pct) else None
+            out[c6] = (price, pct)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def build_monitor_table_advanced(
     etf_list: pd.DataFrame,
     days: int = 30,
@@ -444,13 +550,20 @@ def build_monitor_table_advanced(
 ) -> pd.DataFrame:
     """拉取日线，计算行情透视、偏离度、溢价率、每日操作建议与建议操作频率；单只失败则该行填错误。"""
     get_hist = fetcher or (lambda s, d, ms, ml: fetch_etf_daily(s, d, ms, ml))
+    sina_spot_map = _get_sina_spot_map() if DATA_SOURCE == "sina" else {}
     if spot_premium_map is None:
         try:
-            spot_premium_map = get_etf_spot_premium_map(etf_list["代码"].astype(str).tolist())
+            spot_premium_map = get_etf_spot_premium_map(
+                etf_list["代码"].astype(str).tolist(),
+                sina_price_map=sina_spot_map if DATA_SOURCE == "sina" else None,
+            )
         except Exception:
             spot_premium_map = {}
+        time.sleep(REQUEST_DELAY_SECONDS)
     rows = []
-    for _, row in etf_list.iterrows():
+    for i, (_, row) in enumerate(etf_list.iterrows()):
+        if i > 0:
+            time.sleep(REQUEST_DELAY_SECONDS)
         code = str(row["代码"]).strip()
         name = row.get("名称", code)
         category = row.get("指数简称", "其他")
@@ -564,10 +677,16 @@ def build_monitor_table_advanced(
                 if v is None or pd.isna(v):
                     return None
                 return round(float(v), 4)
+            # 使用新浪数据源时，最新价/涨跌幅用新浪实时行情表，避免日线接口滞后
+            spot_price, spot_pct = (None, None)
+            if DATA_SOURCE == "sina" and sina_spot_map:
+                spot_price, spot_pct = sina_spot_map.get(code, (None, None))
+            display_price = round(float(spot_price), 3) if spot_price is not None else round(float(close), 3)
+            display_pct = round(spot_pct, 2) if spot_pct is not None else (round(pct, 2) if pct is not None else None)
             rows.append({
                 "代码": code, "名称": name, "指数简称": category,
-                "最新价": round(float(close), 4),
-                "涨跌幅": round(pct, 2) if pct is not None else None,
+                "最新价": display_price,
+                "涨跌幅": display_pct,
                 "MA5": _round_ma(last.get("MA_short")),
                 "MA20": _round_ma(last.get("MA20")),
                 "MA60": _round_ma(last.get("MA60")),
@@ -618,35 +737,14 @@ def get_etf_hist_for_chart(
     ma_short: int = 5,
     ma_long: int = 20,
 ) -> pd.DataFrame | None:
-    """获取单只 ETF 的 OHLC + 均线 + 布林带，用于 Plotly K 线图。"""
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=max(days, 90))
-    start_str = start_date.strftime("%Y%m%d")
-    end_str = end_date.strftime("%Y%m%d")
-    try:
-        raw = ak.fund_etf_hist_em(
-            symbol=symbol.strip(),
-            period="daily",
-            start_date=start_str,
-            end_date=end_str,
-            adjust="qfq",
-        )
-    except Exception:
+    """获取单只 ETF 的 OHLC + 均线 + 布林带，用于 Plotly K 线图。复用 fetch_etf_daily 以支持 DATA_SOURCE。"""
+    df = fetch_etf_daily(symbol, days=max(days, 90), ma_short=ma_short, ma_long=ma_long)
+    if df is None or df.empty:
         return None
-    if raw is None or raw.empty:
-        return None
-    raw = raw.rename(columns=lambda c: str(c).strip())
-    need = ["日期", "开盘", "最高", "最低", "收盘"]
-    if not all(k in raw.columns for k in need):
-        return None
-    df = raw[need + (["成交量"] if "成交量" in raw.columns else [])].copy()
-    if "成交量" not in df.columns:
-        df["成交量"] = np.nan
-    df["日期"] = pd.to_datetime(df["日期"])
     df = df.sort_values("日期").tail(days + 30).reset_index(drop=True)
-    close = df["收盘"]
-    df["MA_short"] = close.rolling(ma_short, min_periods=1).mean()
-    df["MA_long"] = close.rolling(ma_long, min_periods=1).mean()
-    _, up, lo = bollinger(close, BB_PERIOD, BB_STD)
-    df["BB_upper"], df["BB_lower"] = up, lo
-    return df
+    need = ["日期", "开盘", "最高", "最低", "收盘", "MA_short", "MA_long", "BB_upper", "BB_lower"]
+    for c in need:
+        if c not in df.columns:
+            return None
+    cols = need + (["成交量"] if "成交量" in df.columns else [])
+    return df[[c for c in cols if c in df.columns]].copy()

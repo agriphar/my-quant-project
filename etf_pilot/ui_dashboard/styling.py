@@ -9,10 +9,13 @@ def filter_by_category(
     category_all: str,
     category_keywords: dict,
 ) -> pd.DataFrame:
-    """按所选 ETF 类别筛选：selected_category 非「全部」时用指数简称关键词过滤。"""
+    """按所选 ETF 类别筛选：用指数简称或名称含任一关键词即归入该类。"""
     if selected_category != category_all and selected_category in category_keywords:
         keywords = category_keywords[selected_category]
-        mask = df_full["指数简称"].astype(str).str.contains("|".join(keywords), case=False, na=False)
+        pattern = "|".join(keywords)
+        col_simple = df_full["指数简称"].astype(str)
+        col_name = df_full["名称"].astype(str) if "名称" in df_full.columns else pd.Series("", index=df_full.index)
+        mask = col_simple.str.contains(pattern, case=False, na=False) | col_name.str.contains(pattern, case=False, na=False)
         return df_full.loc[mask]
     return df_full
 

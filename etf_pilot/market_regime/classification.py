@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """自动资产分类：基于 3 年年化波动率与最大回撤，区分 Core / Tactical。"""
+import json
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-import json
 import pandas as pd
 import numpy as np
 import akshare as ak
@@ -12,35 +13,47 @@ from config.settings import (
     CLASSIFICATION_VOL_THRESHOLD,
     CLASSIFICATION_CACHE_DAYS,
     CLASSIFICATION_LOOKBACK_YEARS,
+    DATA_SOURCE,
+    to_sina_symbol,
 )
 from strategy.asset_type import ASSET_TYPE_CORE, ASSET_TYPE_TACTICAL
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CACHE_PATH = DATA_DIR / "etf_classification.json"
 TRADING_DAYS_PER_YEAR = 252
+logger = logging.getLogger(__name__)
 
 
 def _fetch_hist_3y(symbol: str) -> pd.DataFrame | None:
-    """获取单只 ETF 过去约 3 年的日线（仅日期、收盘）。"""
+    """获取单只 ETF 过去约 3 年的日线（仅日期、收盘）。支持 DATA_SOURCE=em/sina。"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=CLASSIFICATION_LOOKBACK_YEARS * 365 + 100)
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
+    raw = None
     try:
-        raw = ak.fund_etf_hist_em(
-            symbol=symbol.strip(),
-            period="daily",
-            start_date=start_str,
-            end_date=end_str,
-            adjust="qfq",
-        )
-    except Exception:
+        if DATA_SOURCE == "sina":
+            raw = ak.fund_etf_hist_sina(symbol=to_sina_symbol(symbol))
+            if raw is not None and not raw.empty:
+                raw = raw.rename(columns={"date": "日期", "close": "收盘"})
+                raw["日期"] = pd.to_datetime(raw["日期"])
+                raw = raw[(raw["日期"].dt.strftime("%Y%m%d") >= start_str) & (raw["日期"].dt.strftime("%Y%m%d") <= end_str)]
+        else:
+            raw = ak.fund_etf_hist_em(
+                symbol=symbol.strip(),
+                period="daily",
+                start_date=start_str,
+                end_date=end_str,
+                adjust="qfq",
+            )
+    except Exception as e:
+        logger.warning("_fetch_hist_3y 失败 symbol=%s: %s", symbol, e, exc_info=True)
         return None
     if raw is None or raw.empty:
         return None
     raw = raw.rename(columns=lambda c: str(c).strip())
-    date_col = "日期" if "日期" in raw.columns else (raw.columns[0] if len(raw.columns) else None)
-    close_col = next((c for c in ["收盘", "收盘价"] if c in raw.columns), None)
+    date_col = next((c for c in ["日期", "date"] if c in raw.columns), raw.columns[0] if len(raw.columns) else None)
+    close_col = next((c for c in ["收盘", "收盘价", "close"] if c in raw.columns), None)
     if not date_col or not close_col:
         return None
     df = raw[[date_col, close_col]].copy()
@@ -138,8 +151,8 @@ def get_cached_classification(etf_list: pd.DataFrame) -> pd.DataFrame:
                     etf_list = etf_list.copy()
                     etf_list["类型"] = etf_list["代码"].astype(str).map(lambda c: type_map.get(c, ASSET_TYPE_TACTICAL))
                     return etf_list
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("读取分类缓存 etf_classification.json 失败: %s", e, exc_info=True)
     # 重新计算并写缓存
     result = classify_etfs(etf_list)
     try:
@@ -148,8 +161,8 @@ def get_cached_classification(etf_list: pd.DataFrame) -> pd.DataFrame:
                 "updated": now.strftime("%Y-%m-%d"),
                 "rows": result.to_dict("records"),
             }, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("写入分类缓存 etf_classification.json 失败: %s", e, exc_info=True)
     type_map = result.set_index("代码")["类型"].to_dict()
     etf_list = etf_list.copy()
     etf_list["类型"] = etf_list["代码"].astype(str).map(lambda c: type_map.get(c, ASSET_TYPE_TACTICAL))
