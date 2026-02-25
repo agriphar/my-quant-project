@@ -108,15 +108,19 @@ def _describe_risk(risk_level: str | None) -> str:
     return RISK_LABELS.get(risk_level, risk_level)
 
 
-def _why_this_decision(decision: str, premium_vetoed: bool) -> str:
+def _why_this_decision(decision: str, premium_deviation_val: float | None = None) -> str:
     """用自然语言说明「为什么是这个结论」，不写分数。"""
-    if premium_vetoed or decision == "极度过热，禁买":
-        return "当前溢价相对近期明显偏高，偏离度过大，因此无论其他条件如何都不建议买入。"
     if decision == "强烈建议补仓":
+        if premium_deviation_val is not None and premium_deviation_val > 2.5:
+            return "动量、趋势、溢价与波动多方面偏有利，但溢价偏离度较高，综合判断仍可考虑补仓，但需注意溢价风险。"
         return "动量、趋势、溢价与波动多方面偏有利，风险可控，综合判断适合逢低补仓。"
     if decision == "持有观望":
+        if premium_deviation_val is not None and premium_deviation_val > 2.5:
+            return "信号与风险组合未形成明确加仓或减仓条件，且溢价偏离度较高，建议维持现状、观望为主。"
         return "信号与风险组合未形成明确加仓或减仓条件，建议维持现状、观望为主。"
     if decision == "考虑套利/减仓":
+        if premium_deviation_val is not None and premium_deviation_val > 2.5:
+            return "趋势或溢价偏不利，溢价偏离度较高，建议考虑兑现部分仓位或等待更好机会。"
         return "趋势或溢价偏不利，或风险等级较高，建议考虑兑现部分仓位或等待更好机会。"
     return ""
 
@@ -126,7 +130,7 @@ def generate_reasoning(
     signal_states: dict[str, str] | None,
     risk_level: str | None,
     decision: str,
-    premium_vetoed: bool = False,
+    premium_deviation_val: float | None = None,
 ) -> dict[str, Any]:
     """
     根据 regime、signals、risk level、final decision 生成结构化理由。
@@ -140,7 +144,7 @@ def generate_reasoning(
     signals = _describe_signal_states(signal_states)
     regime_lines = _describe_regime(regime)
     risk_desc = _describe_risk(risk_level)
-    conclusion = _why_this_decision(decision, premium_vetoed)
+    conclusion = _why_this_decision(decision, premium_deviation_val)
 
     risk_and_regime = [risk_desc]
     risk_and_regime.extend(regime_lines)
@@ -176,7 +180,7 @@ def explain_decision(
     signal_states: dict[str, str] | None,
     risk_level: str | None,
     decision: str,
-    premium_vetoed: bool = False,
+    premium_deviation_val: float | None = None,
 ) -> dict[str, Any]:
     """
     统一入口：生成结构化理由，并附带可直接展示的短句与长文。
@@ -191,7 +195,7 @@ def explain_decision(
         signal_states=signal_states,
         risk_level=risk_level,
         decision=decision,
-        premium_vetoed=premium_vetoed,
+        premium_deviation_val=premium_deviation_val,
     )
     one_liner = structured["conclusion"] or "—"
     readable = format_reasoning_readable(structured)

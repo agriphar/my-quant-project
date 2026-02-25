@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """每日操作建议、建议操作频率、信号准确率 30d。"""
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
 from market_regime.trend import linear_regression_r2_slope, REGRESSION_WINDOW
 from signal_engine.states import get_signal_states
 from risk_engine import evaluate_risk
-from .scoring import premium_deviation, get_advice
+from .compat import decision_to_legacy_format, compute_daily_action_compat
 
 SIGNAL_LOOKBACK_DAYS = 30
 SIGNAL_FWD_DAYS = 5
@@ -65,11 +69,21 @@ def compute_daily_action(
     weight_pct: float | None = None,
 ) -> tuple:
     """
+    ⚠️ 已废弃：此函数使用旧的架构，新代码应使用 compute_daily_action_v2()。
+
     每日操作建议：Signal Engine 出状态 → Risk Engine 评估风险等级 → Decision Engine 组合状态+风险+regime → 建议。
     Decision Engine 依赖 Risk Engine：风险等级 HIGH 时提高强烈补仓/持有门槛。
+    返回 (action, reason, display_label, confidence_band, conflicting_signals, total_score)。
     """
+    import warnings
+    warnings.warn(
+        "compute_daily_action() is deprecated. "
+        "Use compute_daily_action_v2() instead, which uses the new architecture.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if last.get("收盘") is None or pd.isna(last.get("收盘")):
-        return "持有观望", "数据不足", "观望", "low", False
+        return "持有观望", "数据不足", "观望", "low", False, 0.0
     signal_states = get_signal_states(
         last,
         r2=r2,
@@ -77,21 +91,120 @@ def compute_daily_action(
         premium_pctile_60=premium_pctile_60,
         atr_pct=atr_pct,
     )
-    risk_result = evaluate_risk(
+    # ⚠️ 旧接口：直接传递原始数据给 Risk Engine（违反架构原则）
+    # 新代码应使用：risk_result = evaluate_risk(signal_states=signal_states, history=history)
+    # 注意：旧的 evaluate_risk 可能接受这些参数，但新架构中不再接受
+    try:
+        # 尝试使用新接口（只传递 signal_states）
+        risk_result = evaluate_risk(
+            signal_states=signal_states,
+            history=None,
+            lookback_days=5,
+        )
+    except TypeError:
+        # 如果新接口不可用，尝试旧接口（向后兼容）
+        risk_result = evaluate_risk(
+            atr_pct=atr_pct,  # ❌ 违反架构原则：传递原始数据
+            pct_drawdown_from_high=pct_drawdown_from_high,
+            signal_states=signal_states,
+            weight_pct=weight_pct,
+        )
+    # ✅ 使用新架构（通过适配器保持向后兼容）
+    decision = compute_daily_action_v2(
+        last=last,
+        premium_pctile_60=premium_pctile_60,
+        r2=r2,
+        slope=slope,
         atr_pct=atr_pct,
-        pct_drawdown_from_high=pct_drawdown_from_high,
+        market_regime=market_regime,
+        history=None,
+    )
+    # 转换为旧格式
+    return decision_to_legacy_format(decision)
+
+
+def compute_daily_action_v2(
+    last: pd.Series,
+    premium_pctile_60: float | None = None,
+    r2: float | None = None,
+    slope: float | None = None,
+    atr_pct: float | None = None,
+    market_regime: dict | None = None,
+    history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """
+    每日操作建议（新架构）：使用新的三层决策逻辑。
+
+    参数:
+    - last: 最后一行数据（Series 或 dict），用于提取 RSI 和 ATR
+    - premium_pctile_60: 溢价率 60 日分位数（可选）
+    - r2: 线性回归的 R² 值（可选）
+    - slope: 线性回归的斜率（可选）
+    - atr_pct: ATR 百分比（可选，如果未提供则从 last 计算）
+    - market_regime: 市场制度字典（可选）
+    - history: Signal Engine 的历史状态序列（可选，用于 Risk Engine 和 Confidence Engine）
+
+    返回:
+    {
+        "action": "INCREASE" | "HOLD" | "REDUCE" | "WAIT",
+        "aggressiveness": "LOW" | "MEDIUM" | "HIGH",
+        "reason_tags": [...],
+        "signal_states": {...},
+        "risk_result": {...},
+        "confidence_result": {...}
+    }
+    """
+    from decision_engine.decision import make_decision
+    from confidence_engine import calculate_confidence
+
+    if last.get("收盘") is None or pd.isna(last.get("收盘")):
+        return {
+            "action": "WAIT",
+            "aggressiveness": "LOW",
+            "reason_tags": ["uncertain_signals"],
+            "signal_states": {},
+            "risk_result": {},
+            "confidence_result": {},
+        }
+
+    # 1. Signal Engine
+    signal_states = get_signal_states(
+        last,
+        r2=r2,
+        slope=slope,
+        premium_pctile_60=premium_pctile_60,
+        atr_pct=atr_pct,
+    )
+
+    # 2. Risk Engine（只使用 Signal Engine 的输出）
+    risk_result = evaluate_risk(
         signal_states=signal_states,
-        weight_pct=weight_pct,
+        history=history,
+        lookback_days=5,
     )
-    dev = premium_deviation(premium_pct, avg_premium_22d, premium_std_22d)
-    action, reason, display_label, confidence_band = get_advice(
-        signal_states,
-        dev,
-        market_regime,
-        risk_level=risk_result["level"],
+
+    # 3. Confidence Engine（使用 Signal Engine 和 Risk Engine 的输出）
+    confidence_result = calculate_confidence(
+        signal_states=signal_states,
+        risk_result=risk_result,
+        market_regime=market_regime,
+        history=history,
+        lookback_days=5,
     )
-    conflicting_signals = risk_result.get("signal_disagreement") == "HIGH"
-    return action, reason, display_label, confidence_band, conflicting_signals
+
+    # 4. Decision Engine（使用所有前序层的输出）
+    decision = make_decision(
+        signal_states=signal_states,
+        risk_result=risk_result,
+        confidence_result=confidence_result,
+    )
+
+    return {
+        **decision,
+        "signal_states": signal_states,
+        "risk_result": risk_result,
+        "confidence_result": confidence_result,
+    }
 
 
 def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAYS) -> int:
@@ -104,8 +217,26 @@ def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAY
     tail = hist.tail(days)
     count = 0
     for _, row in tail.iterrows():
-        act, *_ = compute_daily_action(row)
-        if act in ("强烈建议补仓", "考虑套利/减仓"):
+        # ✅ 使用新架构
+        decision = compute_daily_action_v2(
+            last=row,
+            premium_pctile_60=None,  # 简化：不计算溢价分位
+            r2=None,  # 简化：不计算趋势
+            slope=None,
+            atr_pct=None,
+            market_regime=None,
+            history=None,
+        )
+        act = decision.get("action", "HOLD")
+        # 转换为旧格式的动作名称
+        action_map = {
+            "INCREASE": "强烈建议补仓",
+            "REDUCE": "考虑套利/减仓",
+            "HOLD": "持有观望",
+            "WAIT": "等待",
+        }
+        act_cn = action_map.get(act, "持有观望")
+        if act_cn in ("强烈建议补仓", "考虑套利/减仓"):
             count += 1
     return count
 
@@ -175,16 +306,25 @@ def compute_signal_accuracy_30d(
                 avg_22_i = float(tail22.mean())
                 std_22_i = float(tail22.std()) if len(tail22) > 1 and tail22.std() and not pd.isna(tail22.std()) else None
                 pct_60_i = _percentileofscore(sub.values, float(premium_i))
-        action = compute_daily_action(
-            row_i,
-            premium_pct=float(premium_i) if premium_i is not None and not pd.isna(premium_i) else None,
-            avg_premium_22d=avg_22_i,
-            premium_std_22d=std_22_i,
+        # ✅ 使用新架构
+        decision = compute_daily_action_v2(
+            last=row_i,
             premium_pctile_60=pct_60_i,
             r2=r2_i,
             slope=slope_i,
             atr_pct=atr_pct_i,
-        )[0]
+            market_regime=None,
+            history=None,
+        )
+        action_new = decision.get("action", "HOLD")
+        # 转换为旧格式的动作名称
+        action_map = {
+            "INCREASE": "强烈建议补仓",
+            "REDUCE": "考虑套利/减仓",
+            "HOLD": "持有观望",
+            "WAIT": "等待",
+        }
+        action = action_map.get(action_new, "持有观望")
         if action in ("持有观望", "极度过热，禁买"):
             continue
         if action == "强烈建议补仓":

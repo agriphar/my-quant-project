@@ -136,14 +136,14 @@ def run():
             "代码", "名称", "最新价", "涨跌幅",
             "距一年高%", "距一年低%",
             "Bias_MA20", "Bias_MA60", "Bias_MA200",
-            "明日建议", "信心区间", "信号分歧显示", "建议操作频率", "溢价率显示", "RSI", "信号准确率显示",
+            "明日建议", "信心区间", "综合评分", "信号分歧显示", "建议操作频率", "溢价率显示", "RSI", "信号准确率显示",
         ]
         show_cols = [c for c in show_cols if c in df_display.columns]
         table_df = df_display[show_cols].copy()
         table_df = add_明日建议_warning_prefix(table_df, df_display)
         table_df = table_df.replace([np.inf, -np.inf], np.nan)
         # 仅对非数值列用 "—" 填充空值；数值列强制为 float，保证 PyArrow 可序列化
-        num_cols = {"最新价", "涨跌幅", "距一年高%", "距一年低%", "Bias_MA20", "Bias_MA60", "Bias_MA200", "RSI", "建议操作频率"}
+        num_cols = {"最新价", "涨跌幅", "距一年高%", "距一年低%", "Bias_MA20", "Bias_MA60", "Bias_MA200", "RSI", "建议操作频率", "综合评分"}
         for col in table_df.columns:
             if col in num_cols:
                 table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
@@ -163,6 +163,7 @@ def run():
                 "Bias_MA200": st.column_config.NumberColumn(format="%.1f%%"),
                 "明日建议": st.column_config.TextColumn("明日建议"),
                 "信心区间": st.column_config.TextColumn("信心"),
+                "综合评分": st.column_config.NumberColumn(format="%.1f", help="综合评分（满分10分）"),
                 "信号分歧显示": st.column_config.TextColumn("信号分歧"),
                 "溢价率显示": st.column_config.TextColumn("溢价率"),
                 "RSI": st.column_config.NumberColumn(format="%.0f"),
@@ -184,9 +185,11 @@ def run():
                 reason = sel_row.get("建议理由", "")
                 name = sel_row.get("名称", "")
                 confidence = sel_row.get("信心区间", "—")
+                total_score = sel_row.get("综合评分", None)
                 conflicting = sel_row.get("信号分歧", False)
                 st.info(f"**参考结论：{display_label}**  \n理由：{reason}")
-                st.caption(f"标的：{name} · 信心区间：{confidence}")
+                score_text = f" · 综合评分：{total_score:.1f}" if total_score is not None and not pd.isna(total_score) else ""
+                st.caption(f"标的：{name} · 信心区间：{confidence}{score_text}")
                 if conflicting:
                     st.warning("当前存在信号分歧，多因子方向不一致，请综合判断后再做决策。")
 

@@ -8,7 +8,8 @@ from signal_engine.signals import (
     compute_addon_suggestion,
     compute_grid_signal,
 )
-from decision_engine.scoring import premium_deviation, calculate_score, get_signal_from_score
+from decision_engine.compat import premium_deviation
+# ⚠️ calculate_score 和 get_signal_from_score 已废弃，不再导出
 
 __all__ = [
     "get_asset_type",
@@ -20,6 +21,5 @@ __all__ = [
     "compute_addon_suggestion",
     "compute_grid_signal",
     "premium_deviation",
-    "calculate_score",
-    "get_signal_from_score",
+    # ⚠️ calculate_score 和 get_signal_from_score 已废弃
 ]

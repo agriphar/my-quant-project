@@ -22,10 +22,12 @@ from config.settings import (
 from market_regime.trend import compute_trend_classification, REGRESSION_WINDOW
 from signal_engine.indicators import rsi, bollinger, atr, pct_from_1y_high_low, bias_pct
 from decision_engine.daily_action import (
-    compute_daily_action,
+    compute_daily_action,  # ⚠️ 已废弃，但保留向后兼容
+    compute_daily_action_v2,  # ✅ 新架构
     compute_action_frequency,
     compute_signal_accuracy_30d,
 )
+from decision_engine.compat import decision_to_legacy_format
 from decision_engine.daily_action import SIGNAL_LOOKBACK_DAYS
 from risk_engine import drawdown_15pct_value  # 向后兼容：原 etf_data 对外提供
 
@@ -592,6 +594,7 @@ def build_monitor_table_advanced(
                 "RSI": None,
                 "信号准确率30d": None,
                 "信号准确率显示": "—",
+                "综合评分": None,
                 "错误": err_msg or "获取失败",
             })
             continue
@@ -632,8 +635,11 @@ def build_monitor_table_advanced(
             if action_no_nav is not None:
                 action, reason = action_no_nav, (reason_no_nav or "接口未返回 IOPV/净值列或数据全为空")
                 display_label = "仅参考实时溢价" if "仅参考实时溢价" in (action_no_nav or "") else "数据不足"
-                confidence_band, conflicting_signals = "low", False
+                confidence_band, conflicting_signals, total_score = "low", False, 0.0
                 advice_type = "持有观望"
+                # 为 action_no_nav 情况设置显示格式
+                confidence_band_cn = "低(0.0)"
+                display_label_with_score = f"{display_label}(0.0)"
             else:
                 atr_pct = None
                 if last.get("ATR") is not None and last.get("收盘") and float(last.get("收盘", 0) or 0) > 0:
@@ -649,25 +655,38 @@ def build_monitor_table_advanced(
                             pct_drawdown_from_high = (float(high_60d) - float(close)) / float(high_60d) * 100
                         except (TypeError, ValueError):
                             pass
-                action, reason, display_label, confidence_band, conflicting_signals = compute_daily_action(
-                    last,
-                    premium_pct=premium_pct,
-                    avg_premium_22d=avg_premium_22d,
-                    premium_std_22d=premium_std_22d,
+                # ✅ 使用新架构（通过适配器保持向后兼容）
+                # 准备历史状态序列（用于 Risk Engine 和 Confidence Engine）
+                history = None  # TODO: 可以从 hist 构建历史状态序列
+                
+                decision = compute_daily_action_v2(
+                    last=last,
                     premium_pctile_60=premium_pctile_60d,
                     r2=r2,
                     slope=slope,
                     atr_pct=atr_pct,
-                    pct_drawdown_from_high=pct_drawdown_from_high,
+                    market_regime=None,  # TODO: 可以传入 market_regime
+                    history=history,
                 )
+                
+                # 转换为旧格式以保持兼容
+                action, reason, display_label, confidence_band, conflicting_signals, total_score = decision_to_legacy_format(decision)
                 advice_type = action
                 if no_premium_data and premium_valid_count == 0:
-                    action, display_label, confidence_band, conflicting_signals = "溢价数据不足", "溢价数据不足", "low", False
+                    action, display_label, confidence_band, conflicting_signals, total_score = "溢价数据不足", "溢价数据不足", "low", False, 0.0
                     advice_type = "持有观望"
                 elif premium_pctile_60d is None and premium_valid_count == 0 and not no_premium_data:
-                    action, display_label, confidence_band, conflicting_signals = "溢价数据不足", "溢价数据不足", "low", False
+                    action, display_label, confidence_band, conflicting_signals, total_score = "溢价数据不足", "溢价数据不足", "low", False, 0.0
                     advice_type = "持有观望"
+            # 信心区间显示格式：高(分数) / 中(分数) / 低(分数)
             confidence_band_cn = {"high": "高", "medium": "中", "low": "低"}.get(confidence_band, "—")
+            if total_score is not None and not pd.isna(total_score):
+                confidence_band_cn = f"{confidence_band_cn}({total_score:.1f})"
+            # 明日建议显示格式：偏多，可考虑补仓(分数)
+            if total_score is not None and not pd.isna(total_score):
+                display_label_with_score = f"{display_label}({total_score:.1f})"
+            else:
+                display_label_with_score = display_label
             freq = compute_action_frequency(hist, SIGNAL_LOOKBACK_DAYS)
             acc_result = compute_signal_accuracy_30d(hist, nav_hist)
             acc = acc_result.get("信号准确率30d")
@@ -694,8 +713,9 @@ def build_monitor_table_advanced(
                 "距一年高%": round(pct_high, 2) if pct_high is not None else None,
                 "距一年低%": round(pct_low, 2) if pct_low is not None else None,
                 "Bias_MA20": bias_20, "Bias_MA60": bias_60, "Bias_MA200": bias_200,
-                "明日建议": display_label, "建议理由": reason,
+                "明日建议": display_label_with_score, "建议理由": reason,
                 "信心区间": confidence_band_cn, "信号分歧": conflicting_signals, "信号分歧显示": "是" if conflicting_signals else "—", "建议类型": advice_type,
+                "综合评分": round(total_score, 1) if total_score is not None and not pd.isna(total_score) else None,
                 "建议操作频率": freq,
                 "溢价率": premium_pct,
                 "溢价率均值22d": avg_premium_22d,

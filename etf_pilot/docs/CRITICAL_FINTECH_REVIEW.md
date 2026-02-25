@@ -21,7 +21,7 @@
 
 ### 1.3 「信心区间」只是又一层阈值
 
-- **信心区间**由与决策相同的分数和阈值推导得出（`_confidence_band(total, strong_buy, hold, risk_level, vetoed)`）。因此实际链路是：  
+- **信心区间**由与决策相同的分数和阈值推导得出（`_confidence_band(total, strong_buy, hold, risk_level, premium_deviation_val)`）。因此实际链路是：  
   **分数 → 动作（经 strong_buy/hold）→ display_label + confidence_band**。  
   区间没有提供新信息，只是冗余的派生展示。若阈值或风险逻辑变更，信心逻辑必须同步调整，否则界面会错误表达「信心」。
 
@@ -50,8 +50,8 @@
 
 ### 3.1 魔法动作字符串
 
-- 四种内部动作在多处以**字符串字面量**出现：
-  - `decision_engine.scoring`：`"极度过热，禁买"`、`"强烈建议补仓"`、`"持有观望"`、`"考虑套利/减仓"`（见于 `_display_label`、`get_advice`、`get_signal_from_score`）。
+- 三种内部动作在多处以**字符串字面量**出现：
+  - `decision_engine.scoring`：`"强烈建议补仓"`、`"持有观望"`、`"考虑套利/减仓"`（见于 `_display_label`、`get_advice`、`get_signal_from_score`）。注：`"极度过热，禁买"` 已移除，溢价偏离度改为降分项。
   - `explanation_engine.structured_reasoning`：同上四个在 `_why_this_decision` 中。
   - `explanation_engine.reasons`：同上在 `get_reason_for_signal` 中。
   - `ui_dashboard.styling`：同上在 `_row_style_simple` 中（通过数据中的 `advice_type`）。

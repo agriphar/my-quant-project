@@ -2,10 +2,20 @@
 """
 Decision Engine：组合 Signal Engine 的状态 + 市场状态 + 风险 → 买卖建议。
 
+⚠️ 已废弃：此模块中的评分系统已废弃，新代码应使用 decision_engine.decision.make_decision()。
+
 - 不在此计算 RSI/趋势/估值/波动；由 Signal Engine 输出状态。
 - 本模块：state_to_score（状态→分数）、溢价偏离度（风险否决）、get_advice（状态+风险+regime→建议）。
+
+保留此模块仅为向后兼容。新代码应使用：
+- decision_engine.decision.make_decision() - 新的三层决策逻辑
+- decision_engine.signal_direction.determine_signal_direction() - 信号方向判断
+- decision_engine.risk_constraint.apply_risk_constraint() - 风险约束
+- decision_engine.confidence_adjustment.apply_confidence_adjustment() - 置信度调整
 """
 from __future__ import annotations
+
+import warnings
 
 import math
 from typing import Any
@@ -30,10 +40,22 @@ from signal_engine.states import (
     VOLATILITY_HIGH,
     VOLATILITY_UNKNOWN,
 )
+# ⚠️ confidence_engine 已删除，新代码应使用 confidence_engine 目录下的新实现
+try:
+    from confidence_engine import calculate_confidence
+except ImportError:
+    # 如果新模块不可用，定义一个占位函数
+    def calculate_confidence(*args, **kwargs):
+        warnings.warn(
+            "decision_engine.scoring is deprecated. Use decision_engine.make_decision() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return "MEDIUM"
 
-# 相对溢价：偏离度 > 2 视为异常过热，> 2.5 一票否决
-PREMIUM_DEVIATION_HOT = 2.0
-PREMIUM_DEVIATION_VETO = 2.5
+# 相对溢价：偏离度阈值（用于扣分计算，已改为降分机制，不再一票否决）
+PREMIUM_DEVIATION_HOT = 2.0  # 参考阈值：偏离度 > 2 视为异常过热
+PREMIUM_DEVIATION_VETO = 2.5  # 参考阈值：偏离度 > 2.5 视为极度过热（用于扣分计算）
 
 # 总分阈值
 SCORE_STRONG_BUY = 7   # >= 7 强烈建议补仓
@@ -113,6 +135,30 @@ def _score_volatility(atr_pct: float | None) -> float:
     return 2.0 - (float(atr_pct) - ATR_PCT_LOW) / (ATR_PCT_HIGH - ATR_PCT_LOW) * 2.0
 
 
+def _score_premium_deviation_penalty(premium_deviation_val: float | None) -> float:
+    """
+    溢价偏离度扣分函数：根据偏离度扣分，不否决。
+    扣分规则：
+    - 偏离度 ≤ 0：不扣分（0分）
+    - 0 < 偏离度 ≤ 1：轻微扣分（-0.5分）
+    - 1 < 偏离度 ≤ 2：中等扣分（-1.5分）
+    - 2 < 偏离度 ≤ 2.5：较大扣分（-2.5分）
+    - 偏离度 > 2.5：大幅扣分（-3.5分），但不否决
+    返回扣分数值（负数或0）。
+    """
+    if premium_deviation_val is None or not math.isfinite(premium_deviation_val):
+        return 0.0
+    if premium_deviation_val <= 0:
+        return 0.0
+    if premium_deviation_val <= 1.0:
+        return -0.5
+    if premium_deviation_val <= 2.0:
+        return -1.5
+    if premium_deviation_val <= 2.5:
+        return -2.5
+    return -3.5
+
+
 def calculate_score(
     last_row: Any,
     r2: float | None = None,
@@ -121,6 +167,8 @@ def calculate_score(
     atr_pct: float | None = None,
 ) -> dict[str, float]:
     """
+    ⚠️ 已废弃：此函数已废弃，新代码应使用 decision_engine.decision.make_decision()。
+
     加权评分，总分 10 分（按因子去冗余后）。
     - 趋势 (3)：R² + slope
     - 动量 (2)：RSI
@@ -129,6 +177,12 @@ def calculate_score(
     返回 {"trend": float, "momentum": float, "valuation": float, "volatility": float, "total": float}。
     兼容旧键 "tech"（= momentum）、"premium"（= valuation）。
     """
+    warnings.warn(
+        "calculate_score() is deprecated. "
+        "Use decision_engine.decision.make_decision() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     rsi_val = None
     if hasattr(last_row, "get"):
         rsi_val = last_row.get("RSI")
@@ -158,11 +212,20 @@ def calculate_score(
     }
 
 
-def state_to_score(signal_states: dict[str, str]) -> dict[str, float]:
+def state_to_score(signal_states: dict[str, str], premium_deviation_val: float | None = None) -> dict[str, float]:
     """
+    ⚠️ 已废弃：此函数已废弃，新代码应使用 decision_engine.decision.make_decision()。
+
     将 Signal Engine 的状态字典转为 10 分制各因子分与总分。
     仅做状态→分数映射，不产生建议。
+    溢价偏离度作为降分项参与评分计算。
     """
+    warnings.warn(
+        "state_to_score() is deprecated. "
+        "Use decision_engine.decision.make_decision() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     m = signal_states.get("momentum") or MOMENTUM_NEUTRAL
     t = signal_states.get("trend") or TREND_UNKNOWN
     v = signal_states.get("valuation") or VALUATION_UNKNOWN
@@ -177,6 +240,11 @@ def state_to_score(signal_states: dict[str, str]) -> dict[str, float]:
     volatility = 2.0 if vol == VOLATILITY_LOW else (1.0 if vol == VOLATILITY_MEDIUM else (0.0 if vol == VOLATILITY_HIGH else 1.0))
 
     total = momentum + trend + valuation + volatility
+    
+    # 应用溢价偏离度扣分
+    penalty = _score_premium_deviation_penalty(premium_deviation_val)
+    total = max(0.0, total + penalty)  # 确保总分不低于0
+    
     return {
         "trend": round(trend, 2),
         "momentum": round(momentum, 2),
@@ -193,16 +261,22 @@ def _confidence_band(
     strong_buy: float,
     hold: float,
     risk_level: str | None,
-    vetoed: bool,
+    premium_deviation_val: float | None = None,
 ) -> str:
     """
     将分数与风险映射为信心区间（非精确分数），用于展示不确定性。
-    high / medium / low；高风险或一票否决时下调。
+    high / medium / low；高风险或溢价偏离度高时下调。
+    
+    注意：此函数已废弃，保留仅为向后兼容。新的置信度计算应使用 confidence_engine.calculate_confidence。
     """
     from risk_engine import RISK_HIGH
 
-    if vetoed:
+    # 溢价偏离度高时降低信心
+    if premium_deviation_val is not None and premium_deviation_val > PREMIUM_DEVIATION_VETO:
+        if total >= strong_buy:
+            return "medium"
         return "low"
+    
     if total >= strong_buy:
         return "medium" if risk_level == RISK_HIGH else "high"
     if total >= hold:
@@ -230,15 +304,26 @@ def get_advice(
     premium_deviation_val: float | None,
     market_regime: dict[str, str] | None = None,
     risk_level: str | None = None,
-) -> tuple[str, str, str, str]:
+    atr_pct: float | None = None,
+) -> tuple[str, str, str, str, float]:
     """
+    ⚠️ 已废弃：此函数已废弃，新代码应使用 decision_engine.decision.make_decision()。
+
     组合：信号状态 + 风险（溢价偏离度）+ 可选市场状态 + 风险引擎等级 → 明日建议与理由。
-    返回 (action, reason, display_label, confidence_band)。
-    display_label 为界面用非确定性措辞；confidence_band 为 high/medium/low。
+    返回 (action, reason, display_label, confidence_band, total_score)。
+    display_label 为界面用非确定性措辞；confidence_band 为 high/medium/low（小写，兼容现有代码）；total_score 为总分。
+    溢价偏离度作为降分项参与评分，不再一票否决。
+    置信度使用独立的置信度引擎计算，不依赖总分。
     """
+    warnings.warn(
+        "get_advice() is deprecated. "
+        "Use decision_engine.decision.make_decision() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from risk_engine import RISK_HIGH, RISK_MEDIUM
 
-    score_result = state_to_score(signal_states)
+    score_result = state_to_score(signal_states, premium_deviation_val)
     total = score_result.get("total", 0) or 0
     strong_buy = SCORE_STRONG_BUY
     hold = SCORE_HOLD
@@ -251,10 +336,8 @@ def get_advice(
     elif risk_level == RISK_MEDIUM:
         strong_buy = 7.5
         hold = 4.5
-    vetoed = premium_deviation_val is not None and premium_deviation_val > PREMIUM_DEVIATION_VETO
-    if vetoed:
-        action = "极度过热，禁买"
-    elif total >= strong_buy:
+    # 移除一票否决逻辑，根据总分判断
+    if total >= strong_buy:
         action = "强烈建议补仓"
     elif total >= hold:
         action = "持有观望"
@@ -266,12 +349,19 @@ def get_advice(
         signal_states=signal_states,
         risk_level=risk_level,
         decision=action,
-        premium_vetoed=vetoed,
+        premium_deviation_val=premium_deviation_val,
     )
     reason = explained["one_liner"]
     display_label = _display_label(action)
-    confidence_band = _confidence_band(total, strong_buy, hold, risk_level, vetoed)
-    return action, reason, display_label, confidence_band
+    # 使用独立的置信度引擎，不依赖总分
+    confidence = calculate_confidence(
+        signal_states=signal_states,
+        atr_pct=atr_pct,
+        market_regime=market_regime,
+    )
+    # 转换为小写以兼容现有代码（UI 期望 "high"/"medium"/"low"）
+    confidence_band = confidence.lower()
+    return action, reason, display_label, confidence_band, total
 
 
 def get_signal_from_score(
@@ -280,21 +370,19 @@ def get_signal_from_score(
 ) -> tuple[str, str]:
     """
     根据总分与溢价偏离度输出建议（兼容旧入口：已有 score 时使用）。
-    - 一票否决：溢价偏离度 > 2.5 -> 极度过热，禁买。
+    溢价偏离度已作为降分项参与评分计算，不再一票否决。
     - 总分 >= 7：强烈建议补仓
     - 4 <= 总分 < 7：持有观望
     - 总分 < 4：考虑套利/减仓
     理由文案由 explanation_engine 生成。
     """
     total = score_result.get("total", 0) or 0
-    vetoed = premium_deviation_val is not None and premium_deviation_val > PREMIUM_DEVIATION_VETO
-    if vetoed:
-        action = "极度过热，禁买"
-    elif total >= SCORE_STRONG_BUY:
+    # 移除一票否决逻辑，根据总分判断
+    if total >= SCORE_STRONG_BUY:
         action = "强烈建议补仓"
     elif total >= SCORE_HOLD:
         action = "持有观望"
     else:
         action = "考虑套利/减仓"
-    reason = get_reason_for_signal(action, total, vetoed)
+    reason = get_reason_for_signal(action, total, premium_deviation_val)
     return action, reason

@@ -8,7 +8,7 @@
 
 ### 决策看板
 - **行情透视**：最新价、涨跌幅、距一年高/低%、Bias_MA20/60/200，定位当前价格空间。
-- **明日建议**：按「加权评分制」给出「强烈建议补仓 / 持有观望 / 考虑套利/减仓 / 极度过热，禁买」及理由。
+- **明日建议**：基于**四层独立架构**生成「INCREASE（增加仓位）/ HOLD（持有）/ REDUCE（减少仓位）/ WAIT（等待）」及理由。
 - **溢价率**：IOPV 与历史净值计算；(市价 - IOPV)/IOPV × 100%，带 60 日百分位进度条；高分位时明日建议变红并显示 ⚠️。
 - **信号准确率 30d**：仅统计「补仓」「减仓」两类建议，发出买入后 5 日涨或发出卖出后 5 日跌记为正确；样本不足时显示「近期无动作」「样本不足」或百分比。
 - 表格按**建议操作频率**排序，支持整表 `fillna("-")` 与 inf 清洗；数据源异常行（缺少 IOPV/溢价数据不足）浅橘色背景，「样本极少」浅黄色背景。
@@ -30,14 +30,127 @@
 
 ---
 
-## 每日操作建议算法（加权评分制）
+## 核心架构：四层独立系统
 
-- **总分 10 分**：技术面 4 分（RSI、Bias_MA20、距 MA200）+ 趋势面 3 分（R² 与斜率）+ 溢价面 3 分（溢价分位低给满分、高分位扣分）。
-- **信号输出**
-  - 总分 **≥ 7**：**强烈建议补仓**
-  - **4 ≤ 总分 < 7**：**持有观望**
-  - **总分 < 4**：**考虑套利/减仓**
-  - **一票否决**：溢价偏离度 = (当前溢价 − 22 日均值) / 22 日标准差；若 **> 2.5** → **极度过热，禁买**。
+系统采用**严格分层的四层独立架构**，每层职责清晰，依赖关系明确：
+
+```
+原始数据
+    ↓
+Signal Engine（信号引擎）
+    ↓
+Risk Engine（风险引擎）
+    ↓
+Confidence Engine（置信度引擎）
+    ↓
+Decision Engine（决策引擎）
+```
+
+### 1. Signal Engine（信号引擎）
+
+**职责：** 描述 ETF 市场状态，检测市场正在做什么。
+
+**输出：** 独立的状态类别
+- `trend`: "UP" | "DOWN" | "SIDEWAYS" | "UNKNOWN"
+- `momentum`: "ACCELERATING" | "WEAKENING" | "NEUTRAL" | "UNKNOWN"
+- `valuation`: "CHEAP" | "FAIR" | "EXPENSIVE" | "UNKNOWN"
+- `volatility`: "LOW" | "NORMAL" | "HIGH" | "UNKNOWN"
+
+**约束：**
+- ❌ 不输出买卖建议
+- ❌ 不计算评分
+- ❌ 不评估风险
+- ❌ 不评估置信度
+
+### 2. Risk Engine（风险引擎）
+
+**职责：** 评估交易风险条件。
+
+**输入：** Signal Engine 的输出
+
+**输出：**
+- `risk_level`: "LOW" | "MEDIUM" | "HIGH"
+- `risk_flags`: ["high_volatility", "trend_unknown", "signal_conflict", "rapid_transitions"]
+- `components`: {volatility_regime, trend_instability, signal_disagreement, rapid_transitions}
+
+**约束：**
+- ✅ 只能使用 Signal Engine 的输出
+- ❌ 禁止使用原始数据（价格、RSI、ATR 等）
+- ❌ 禁止重新计算信号
+
+### 3. Confidence Engine（置信度引擎）
+
+**职责：** 评估信号可靠性。
+
+**输入：** Signal Engine 和 Risk Engine 的输出
+
+**输出：**
+- `confidence`: "LOW" | "MEDIUM" | "HIGH"
+- `confidence_reason`: ["high_signal_agreement", "stable_regime", "persistent_signals", ...]
+
+**约束：**
+- ✅ 只能使用 Signal Engine 和 Risk Engine 的输出
+- ❌ 禁止使用原始数据
+- ❌ 禁止重新计算前序层的指标
+
+### 4. Decision Engine（决策引擎）
+
+**职责：** 将系统状态转换为投资组合操作。
+
+**输入：** Signal Engine、Risk Engine 和 Confidence Engine 的输出
+
+**输出：**
+- `action`: "INCREASE" | "HOLD" | "REDUCE" | "WAIT"
+- `aggressiveness`: "LOW" | "MEDIUM" | "HIGH"
+- `reason_tags`: ["bullish_signals", "high_risk_constraint", "high_confidence", ...]
+
+**决策逻辑（三层）：**
+1. **Layer 1: Signal Direction** - 基于 Signal Engine 的输出确定基础信号方向
+2. **Layer 2: Risk Constraint** - 基于 Risk Engine 的输出调整初步动作
+3. **Layer 3: Confidence Adjustment** - 基于 Confidence Engine 的输出调整激进程度
+
+**约束：**
+- ✅ 只能使用前序层的输出
+- ❌ 禁止指标计算
+- ❌ 禁止评分聚合
+- ❌ 禁止信号重新计算
+
+---
+
+## 决策逻辑说明
+
+### 决策动作
+
+- **INCREASE（增加仓位）**：信号看多且风险可控
+- **HOLD（持有）**：信号中性或需要观望
+- **REDUCE（减少仓位）**：信号看空或风险过高
+- **WAIT（等待）**：不确定性过高，暂不操作
+
+### 决策规则优先级
+
+1. **风险优先**：高风险时优先保护，限制增加仓位
+2. **信号其次**：基于信号方向确定初步动作
+3. **置信度最后**：调整激进程度，但不改变基本动作
+
+### 示例决策流程
+
+```
+Signal: trend=UP, valuation=CHEAP, momentum=NEUTRAL
+  → Layer 1: BULLISH → INCREASE（初步）
+
+Risk: risk_level=LOW
+  → Layer 2: 不调整 → INCREASE
+
+Confidence: confidence=HIGH
+  → Layer 3: aggressiveness=HIGH
+
+最终输出:
+{
+    "action": "INCREASE",
+    "aggressiveness": "HIGH",
+    "reason_tags": ["bullish_signals", "high_confidence"]
+}
+```
 
 ---
 
@@ -78,6 +191,18 @@ pip install -r requirements.txt
 ```bash
 streamlit run main.py
 ```
+
+---
+
+## 架构文档
+
+详细的架构说明请参考：
+- [核心架构文档](docs/CORE_ARCHITECTURE.md)
+- [迁移指南](docs/MIGRATION_GUIDE.md)
+- [Signal Engine 文档](signal_engine/README.md)
+- [Risk Engine 文档](risk_engine/README.md)
+- [Confidence Engine 文档](confidence_engine/README.md)
+- [Decision Engine 文档](decision_engine/README.md)
 
 ---
 

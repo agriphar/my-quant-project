@@ -1,31 +1,49 @@
 # -*- coding: utf-8 -*-
-"""波动率状态风险：基于 ATR% 或实现波动率，输出 LOW/MEDIUM/HIGH。"""
+"""
+波动率制度风险：基于 Signal Engine 的 volatility 状态评估风险。
+
+只能使用 Signal Engine 的输出，禁止使用原始数据（如 ATR%）。
+"""
 from __future__ import annotations
+
+from signal_engine.states import (
+    VOLATILITY_LOW,
+    VOLATILITY_NORMAL,
+    VOLATILITY_HIGH,
+    VOLATILITY_UNKNOWN,
+)
 
 RISK_LOW = "LOW"
 RISK_MEDIUM = "MEDIUM"
 RISK_HIGH = "HIGH"
 
-# ATR% 阈值：高于上限为高波动状态
-ATR_PCT_MEDIUM = 1.5
-ATR_PCT_HIGH = 3.0
 
+def volatility_regime_risk(volatility_state: str | None) -> str:
+    """
+    基于 Signal Engine 的 volatility 状态评估波动率风险。
 
-def volatility_risk_level(atr_pct: float | None) -> str:
+    参数:
+    - volatility_state: Signal Engine 输出的 volatility 状态
+        "LOW" | "NORMAL" | "HIGH" | "UNKNOWN"
+
+    返回:
+    - "LOW": 低波动风险（volatility = "LOW"）
+    - "MEDIUM": 中等波动风险（volatility = "NORMAL" 或 "UNKNOWN"）
+    - "HIGH": 高波动风险（volatility = "HIGH"）
+
+    逻辑:
+    - Signal Engine 的 volatility 状态直接映射到风险等级
+    - 高波动环境意味着更高的交易风险
     """
-    波动率状态风险：ATR% 越高，风险越高。
-    - ATR% <= 1.5: LOW
-    - 1.5 < ATR% <= 3: MEDIUM
-    - ATR% > 3: HIGH
-    """
-    if atr_pct is None:
+    if not volatility_state:
         return RISK_MEDIUM
-    try:
-        a = float(atr_pct)
-        if a <= ATR_PCT_MEDIUM:
-            return RISK_LOW
-        if a <= ATR_PCT_HIGH:
-            return RISK_MEDIUM
+
+    volatility_state = volatility_state.upper()
+
+    if volatility_state == VOLATILITY_HIGH:
         return RISK_HIGH
-    except (TypeError, ValueError):
+    elif volatility_state == VOLATILITY_LOW:
+        return RISK_LOW
+    else:
+        # NORMAL 或 UNKNOWN 视为中等风险
         return RISK_MEDIUM
