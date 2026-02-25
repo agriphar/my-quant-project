@@ -29,6 +29,9 @@ GRID_STEP_PCT = 0.012                 # 每 1.2% 一档
 # 数据源：em=东方财富（默认），sina=新浪（可避免东方财富网络/代理问题）
 DATA_SOURCE = "sina"
 
+# 是否拉取溢价率/历史净值（用于 Signal 层估值状态）。设为 False 可显著加快启动，估值状态恒为「未知」
+ENABLE_PREMIUM_FETCH = True
+
 
 def to_sina_symbol(code: str) -> str:
     """将 6 位 ETF 代码转为新浪格式：上交所 sh（51/52/56/58 等），深交所 sz（15/16/159 等）。"""

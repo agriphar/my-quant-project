@@ -14,6 +14,7 @@ from config.settings import (
     BB_PERIOD,
     BB_STD,
     DATA_SOURCE,
+    ENABLE_PREMIUM_FETCH,
     REQUEST_DELAY_SECONDS,
     REQUEST_RETRIES,
     REQUEST_RETRY_DELAY_SECONDS,
@@ -550,10 +551,10 @@ def build_monitor_table_advanced(
     fetcher: Callable[[str, int, int, int], pd.DataFrame | None] | None = None,
     spot_premium_map: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """拉取日线，计算行情透视、偏离度、溢价率、每日操作建议与建议操作频率；单只失败则该行填错误。"""
+    """拉取日线，计算行情透视、每日操作建议与建议操作频率；单只失败则该行填错误。溢价率拉取可由 ENABLE_PREMIUM_FETCH 关闭以加快启动。"""
     get_hist = fetcher or (lambda s, d, ms, ml: fetch_etf_daily(s, d, ms, ml))
     sina_spot_map = _get_sina_spot_map() if DATA_SOURCE == "sina" else {}
-    if spot_premium_map is None:
+    if spot_premium_map is None and ENABLE_PREMIUM_FETCH:
         try:
             spot_premium_map = get_etf_spot_premium_map(
                 etf_list["代码"].astype(str).tolist(),
@@ -562,6 +563,8 @@ def build_monitor_table_advanced(
         except Exception:
             spot_premium_map = {}
         time.sleep(REQUEST_DELAY_SECONDS)
+    elif spot_premium_map is None:
+        spot_premium_map = {}
     rows = []
     for i, (_, row) in enumerate(etf_list.iterrows()):
         if i > 0:
@@ -596,32 +599,44 @@ def build_monitor_table_advanced(
                 "信号准确率显示": "—",
                 "综合评分": None,
                 "错误": err_msg or "获取失败",
+                "signal_states": {},
+                "state_stability": None,
+                "risk_result": {},
+                "confidence_result": {},
+                "decision": {},
             })
             continue
         try:
-            nav_hist = get_etf_nav_hist(code, PREMIUM_FETCH_DAYS)
-            reason_no_nav = None
-            if nav_hist is None or nav_hist.empty:
+            if not ENABLE_PREMIUM_FETCH:
+                nav_hist = None
                 avg_premium_22d, premium_pctile_60d, premium_std_22d = None, None, None
                 premium_valid_count, no_premium_data, sample_very_small = 0, True, False
-                if premium_pct is not None and not pd.isna(premium_pct):
-                    premium_display = format_premium_with_bar(premium_pct, None) + " (仅实时)"
-                    action_no_nav = "无历史净值，仅参考实时溢价"
-                    reason_no_nav = "仅实时溢价，无历史分位"
-                else:
-                    premium_display = "无净值数据"
-                    action_no_nav = "缺少 IOPV/净值数据，无法评估溢价"
-                    reason_no_nav = "接口未返回 IOPV/净值列或数据全为空"
-            else:
-                avg_premium_22d, premium_pctile_60d, premium_std_22d, premium_valid_count, no_premium_data, sample_very_small = get_etf_premium_stats(
-                    hist, nav_hist, premium_pct, code=code
-                )
-                premium_display = format_premium_with_bar(premium_pct, premium_pctile_60d)
-                if no_premium_data or (premium_pctile_60d is None and premium_valid_count == 0):
-                    premium_display = "无净值数据"
-                if sample_very_small and premium_display != "无净值数据":
-                    premium_display = premium_display + " (样本极少)"
+                premium_display = "未启用（已禁用溢价拉取）"
                 action_no_nav = None
+            else:
+                nav_hist = get_etf_nav_hist(code, PREMIUM_FETCH_DAYS)
+                reason_no_nav = None
+                if nav_hist is None or nav_hist.empty:
+                    avg_premium_22d, premium_pctile_60d, premium_std_22d = None, None, None
+                    premium_valid_count, no_premium_data, sample_very_small = 0, True, False
+                    if premium_pct is not None and not pd.isna(premium_pct):
+                        premium_display = format_premium_with_bar(premium_pct, None) + " (仅实时)"
+                        action_no_nav = "无历史净值，仅参考实时溢价"
+                        reason_no_nav = "仅实时溢价，无历史分位"
+                    else:
+                        premium_display = "无净值数据"
+                        action_no_nav = "缺少 IOPV/净值数据，无法评估溢价"
+                        reason_no_nav = "接口未返回 IOPV/净值列或数据全为空"
+                else:
+                    avg_premium_22d, premium_pctile_60d, premium_std_22d, premium_valid_count, no_premium_data, sample_very_small = get_etf_premium_stats(
+                        hist, nav_hist, premium_pct, code=code
+                    )
+                    premium_display = format_premium_with_bar(premium_pct, premium_pctile_60d)
+                    if no_premium_data or (premium_pctile_60d is None and premium_valid_count == 0):
+                        premium_display = "无净值数据"
+                    if sample_very_small and premium_display != "无净值数据":
+                        premium_display = premium_display + " (样本极少)"
+                    action_no_nav = None
             r2, slope, _ = compute_trend_classification(hist)
             last = hist.iloc[-1]
             prev = hist.iloc[-2] if len(hist) >= 2 else last
@@ -640,6 +655,7 @@ def build_monitor_table_advanced(
                 # 为 action_no_nav 情况设置显示格式
                 confidence_band_cn = "低(0.0)"
                 display_label_with_score = f"{display_label}(0.0)"
+                _signal_states, _state_stability, _risk_result, _confidence_result, _decision = {}, None, {}, {}, {}
             else:
                 atr_pct = None
                 if last.get("ATR") is not None and last.get("收盘") and float(last.get("收盘", 0) or 0) > 0:
@@ -668,7 +684,15 @@ def build_monitor_table_advanced(
                     market_regime=None,  # TODO: 可以传入 market_regime
                     history=history,
                 )
-                
+                _signal_states = decision.get("signal_states", {})
+                _risk_result = decision.get("risk_result") or {}
+                _confidence_result = decision.get("confidence_result") or {}
+                _state_stability = _risk_result.get("components", {}).get("rapid_transitions")
+                _decision = {
+                    "action": decision.get("action"),
+                    "aggressiveness": decision.get("aggressiveness"),
+                    "reason_tags": decision.get("reason_tags") or [],
+                }
                 # 转换为旧格式以保持兼容
                 action, reason, display_label, confidence_band, conflicting_signals, total_score = decision_to_legacy_format(decision)
                 advice_type = action
@@ -726,6 +750,11 @@ def build_monitor_table_advanced(
                 "信号准确率30d": acc,
                 "信号准确率显示": acc_display,
                 "错误": None,
+                "signal_states": _signal_states,
+                "state_stability": _state_stability,
+                "risk_result": _risk_result,
+                "confidence_result": _confidence_result,
+                "decision": _decision,
             })
         except Exception as e:
             err_msg = str(e)[:80] if e else "处理异常"
@@ -747,6 +776,11 @@ def build_monitor_table_advanced(
                 "信号准确率30d": None,
                 "信号准确率显示": "—",
                 "错误": err_msg,
+                "signal_states": {},
+                "state_stability": None,
+                "risk_result": {},
+                "confidence_result": {},
+                "decision": {},
             })
     return pd.DataFrame(rows)
 

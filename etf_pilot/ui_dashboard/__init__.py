@@ -8,6 +8,7 @@ from .styling import (
     style_radar_rsi,
 )
 from .algorithm_text import ALGORITHM_MARKDOWN
+from .etf_drilldown import render_etf_drilldown
 
 __all__ = [
     "filter_by_category",
@@ -16,4 +17,5 @@ __all__ = [
     "style_dashboard_table",
     "style_radar_rsi",
     "ALGORITHM_MARKDOWN",
+    "render_etf_drilldown",
 ]
