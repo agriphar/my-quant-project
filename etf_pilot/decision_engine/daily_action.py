@@ -69,7 +69,7 @@ def compute_daily_action(
     Decision Engine 依赖 Risk Engine：风险等级 HIGH 时提高强烈补仓/持有门槛。
     """
     if last.get("收盘") is None or pd.isna(last.get("收盘")):
-        return "持有观望", "数据不足", "观望", "low", False
+        return "维持观望/持有", "数据不足", "观望", "low", False
     signal_states = get_signal_states(
         last,
         r2=r2,
@@ -89,13 +89,14 @@ def compute_daily_action(
         dev,
         market_regime,
         risk_level=risk_result["level"],
+        premium_pctile_60=premium_pctile_60,
     )
     conflicting_signals = risk_result.get("signal_disagreement") == "HIGH"
     return action, reason, display_label, confidence_band, conflicting_signals
 
 
 def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAYS) -> int:
-    """过去 N 天内「强烈建议补仓」或「考虑套利/减仓」出现次数，用于排序（建议操作频率）。"""
+    """过去 N 天内「强烈建议补仓」或「建议套利/减仓」出现次数，用于排序（建议操作频率）。"""
     if hist is None or len(hist) < 2 or "收盘" not in hist.columns:
         return 0
     need = ["收盘", "MA60", "RSI", "BB_upper"]
@@ -105,7 +106,7 @@ def compute_action_frequency(hist: pd.DataFrame, days: int = SIGNAL_LOOKBACK_DAY
     count = 0
     for _, row in tail.iterrows():
         act, *_ = compute_daily_action(row)
-        if act in ("强烈建议补仓", "考虑套利/减仓"):
+        if act in ("强烈建议补仓", "建议套利/减仓"):
             count += 1
     return count
 
@@ -185,14 +186,14 @@ def compute_signal_accuracy_30d(
             slope=slope_i,
             atr_pct=atr_pct_i,
         )[0]
-        if action in ("持有观望", "极度过热，禁买"):
+        if action == "维持观望/持有":
             continue
         if action == "强烈建议补仓":
             total += 1
             if ret5 > 0:
                 correct += 1
             continue
-        if action == "考虑套利/减仓":
+        if action == "建议套利/减仓":
             total += 1
             if ret5 < 0:
                 correct += 1

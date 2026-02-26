@@ -6,7 +6,9 @@ from .scoring import (
     state_to_score,
     get_advice,
     get_signal_from_score,
-    PREMIUM_DEVIATION_VETO,
+    PREMIUM_DEVIATION_HOT,
+    PREMIUM_DEVIATION_EXTREME,
+    PREMIUM_DEVIATION_VETO,  # 向后兼容别名
     SCORE_STRONG_BUY,
     SCORE_HOLD,
 )
@@ -22,7 +24,9 @@ __all__ = [
     "state_to_score",
     "get_advice",
     "get_signal_from_score",
-    "PREMIUM_DEVIATION_VETO",
+    "PREMIUM_DEVIATION_HOT",
+    "PREMIUM_DEVIATION_EXTREME",
+    "PREMIUM_DEVIATION_VETO",  # 向后兼容别名
     "SCORE_STRONG_BUY",
     "SCORE_HOLD",
     "compute_daily_action",

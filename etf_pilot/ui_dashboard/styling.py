@@ -63,10 +63,10 @@ def _row_style_simple(row: pd.Series, df_display: pd.DataFrame) -> list:
         return ["background-color: rgba(255,152,0,0.2)"] * len(row)
     if advice_type == "强烈建议补仓":
         return ["background-color: rgba(33,150,243,0.12)"] * len(row)
-    if advice_type == "考虑套利/减仓":
+    if advice_type == "建议套利/减仓":
         return ["background-color: rgba(156,39,176,0.12)"] * len(row)
-    if advice_type == "极度过热，禁买":
-        return ["background-color: rgba(244,67,54,0.12)"] * len(row)
+    if advice_type == "维持观望/持有":
+        return ["background-color: rgba(255,193,7,0.12)"] * len(row)
     return [""] * len(row)
 
 

@@ -108,15 +108,37 @@ def _describe_risk(risk_level: str | None) -> str:
     return RISK_LABELS.get(risk_level, risk_level)
 
 
-def _why_this_decision(decision: str, premium_vetoed: bool) -> str:
+def _why_this_decision(
+    decision: str,
+    premium_deviation_val: float | None = None,
+    total_score: float | None = None,
+    score_result: dict[str, float] | None = None,
+) -> str:
     """用自然语言说明「为什么是这个结论」，不写分数。"""
-    if premium_vetoed or decision == "极度过热，禁买":
-        return "当前溢价相对近期明显偏高，偏离度过大，因此无论其他条件如何都不建议买入。"
+    # 检查溢价偏离警告
+    premium_warning = ""
+    if premium_deviation_val is not None:
+        z_score = float(premium_deviation_val)
+        if z_score > 2.5:
+            premium_warning = f"触发溢价极端过热警告 (z-score: {z_score:.2f})，"
+        elif z_score > 1.5:
+            premium_warning = f"触发溢价偏离警告 (z-score: {z_score:.2f})，"
+    
     if decision == "强烈建议补仓":
+        if premium_warning:
+            return f"{premium_warning}但技术指标走强，综合判断适合逢低补仓。"
         return "动量、趋势、溢价与波动多方面偏有利，风险可控，综合判断适合逢低补仓。"
-    if decision == "持有观望":
+    if decision == "维持观望/持有":
+        if premium_warning:
+            return f"{premium_warning}当前处于震荡区间，建议维持现状、观望为主。"
         return "信号与风险组合未形成明确加仓或减仓条件，建议维持现状、观望为主。"
-    if decision == "考虑套利/减仓":
+    if decision == "建议套利/减仓":
+        if premium_warning:
+            if score_result and score_result.get("valuation", 0) < -2:
+                return f"{premium_warning}因溢价极端过热导致总分降至{total_score:.1f}，建议立即执行套利操作。"
+            return f"{premium_warning}总分降至{total_score:.1f}，建议考虑兑现部分仓位或等待更好机会。"
+        if score_result and score_result.get("valuation", 0) < -2:
+            return f"因溢价极端过热（{score_result.get('valuation', 0):.1f}分惩罚），总分降至{total_score:.1f}，建议立即执行套利操作。"
         return "趋势或溢价偏不利，或风险等级较高，建议考虑兑现部分仓位或等待更好机会。"
     return ""
 
@@ -126,7 +148,9 @@ def generate_reasoning(
     signal_states: dict[str, str] | None,
     risk_level: str | None,
     decision: str,
-    premium_vetoed: bool = False,
+    premium_deviation_val: float | None = None,
+    total_score: float | None = None,
+    score_result: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """
     根据 regime、signals、risk level、final decision 生成结构化理由。
@@ -140,7 +164,7 @@ def generate_reasoning(
     signals = _describe_signal_states(signal_states)
     regime_lines = _describe_regime(regime)
     risk_desc = _describe_risk(risk_level)
-    conclusion = _why_this_decision(decision, premium_vetoed)
+    conclusion = _why_this_decision(decision, premium_deviation_val, total_score, score_result)
 
     risk_and_regime = [risk_desc]
     risk_and_regime.extend(regime_lines)
@@ -176,7 +200,9 @@ def explain_decision(
     signal_states: dict[str, str] | None,
     risk_level: str | None,
     decision: str,
-    premium_vetoed: bool = False,
+    premium_deviation_val: float | None = None,
+    total_score: float | None = None,
+    score_result: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """
     统一入口：生成结构化理由，并附带可直接展示的短句与长文。
@@ -191,7 +217,9 @@ def explain_decision(
         signal_states=signal_states,
         risk_level=risk_level,
         decision=decision,
-        premium_vetoed=premium_vetoed,
+        premium_deviation_val=premium_deviation_val,
+        total_score=total_score,
+        score_result=score_result,
     )
     one_liner = structured["conclusion"] or "—"
     readable = format_reasoning_readable(structured)
